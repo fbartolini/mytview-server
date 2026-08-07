@@ -1,0 +1,85 @@
+@import "tailwindcss";
+@plugin "daisyui";
+
+/* myt-view theme — carries the original identity: cool ink surfaces, one warm
+   "safelight" amber accent used sparingly, metadata rendered as mono. */
+@plugin "daisyui/theme" {
+	name: "myt-view";
+	default: true;
+	color-scheme: dark;
+	--color-base-100: #14161a; /* ink slate */
+	--color-base-200: #1b1e24; /* raised */
+	--color-base-300: #23272f; /* raised + */
+	--color-base-content: #e7e9ee;
+	--color-primary: #e6ad5c; /* safelight amber */
+	--color-primary-content: #1c1608;
+	--color-secondary: #23272f;
+	--color-secondary-content: #e7e9ee;
+	--color-accent: #e6ad5c;
+	--color-accent-content: #1c1608;
+	--color-neutral: #1b1e24;
+	--color-neutral-content: #e7e9ee;
+	--color-info: #7db3d1;
+	--color-success: #7fb069;
+	--color-warning: #e6ad5c;
+	--color-error: #d97056;
+	--radius-selector: 0.5rem;
+	--radius-field: 0.5rem;
+	--radius-box: 0.75rem;
+	--border: 1px;
+}
+
+/* Extra design tokens surfaced as Tailwind utilities (text-muted, border-line…). */
+@theme {
+	--font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+	--font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+	--color-line: #2c313b; /* hairline */
+	--color-line-soft: #21252c;
+	--color-muted: #8b929f; /* metadata text */
+	--color-faint: #626977;
+}
+
+@layer base {
+	html {
+		-webkit-font-smoothing: antialiased;
+	}
+	body {
+		background-color: var(--color-base-100);
+		color: var(--color-base-content);
+		/* let the custom pull-to-refresh own the top overscroll (no native reload) */
+		overscroll-behavior-y: contain;
+		/* guard against any stray element forcing horizontal scroll on narrow screens
+		   (e.g. in the WKWebView shell). `clip` (not `hidden`) keeps the sticky header working. */
+		overflow-x: clip;
+		/* Notch / Dynamic Island awareness in the iOS WebView (viewport-fit=cover +
+		   contentInset:never). Horizontal insets are handled app-wide here so nothing hides
+		   behind the sensor housing in landscape; top/bottom insets live on the specific
+		   sticky/fixed chrome (header, menu, toast) so `position: sticky` still pins correctly.
+		   All env() insets are 0 in desktop browsers, so this is a no-op off-device. */
+		padding-left: env(safe-area-inset-left);
+		padding-right: env(safe-area-inset-right);
+	}
+}
+
+@layer components {
+	.wrap {
+		max-width: 1500px;
+		margin: 0 auto;
+		/* extra bottom room clears the home indicator on notched iPhones (0 elsewhere) */
+		padding: 26px 22px calc(80px + env(safe-area-inset-bottom));
+	}
+	.card-grid {
+		display: grid;
+		gap: 18px;
+		/* min(…, 100%) lets a column shrink below 300px when the container is narrower
+		   than that (phones), instead of forcing 300px and overflowing. Unchanged on desktop. */
+		grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
+	}
+	.channel-grid {
+		display: grid;
+		gap: 14px;
+		/* Smaller min tile so phones get ~2 columns (4 per screen) instead of one giant
+		   card, and desktop packs more per row. */
+		grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr));
+	}
+}

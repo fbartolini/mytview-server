@@ -1,0 +1,36 @@
+# MytView — self-hosted, read-only viewer for your video library.
+# Full option reference: README.md → Configuration.
+
+services:
+  mytview:
+    image: fbartolini/mytview:latest
+    container_name: mytview
+    restart: unless-stopped
+    ports:
+      - "8700:8700"
+    environment:
+      # Signup policy: invite (default — first account bootstraps the owner) | all | off.
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-invite}
+      # Only behind a reverse proxy / TLS: your real external URL.
+      ORIGIN: ${ORIGIN:-}
+      # Behind a reverse proxy/CDN, the header carrying the REAL client address (e.g.
+      # x-forwarded-for) so per-IP login rate limits see clients, not the proxy.
+      ADDRESS_HEADER: ${ADDRESS_HEADER:-}
+      XFF_DEPTH: ${XFF_DEPTH:-1}
+      # 1 = Intel VAAPI hardware encode for live HLS (needs the /dev/dri passthrough below).
+      TRANSCODE_HWACCEL: ${TRANSCODE_HWACCEL:-0}
+    volumes:
+      # READ-ONLY: your library. MytView never writes here.
+      - ${MEDIA_ROOT_HOST:?set MEDIA_ROOT_HOST to your library path}:/media:ro
+      # Durable data: accounts, sessions, watch state + the rebuildable index. BACK THIS UP.
+      - mytview-data:/data
+      # Writable scratch for live-HLS segments (exist only while someone is watching).
+      - ${TRANSCODE_DIR_HOST:-mytview-transcodes}:/transcodes
+
+    # Uncomment to pass an Intel iGPU for VAAPI (with TRANSCODE_HWACCEL=1). Harmless on CPU-only.
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+volumes:
+  mytview-data:
+  mytview-transcodes:
