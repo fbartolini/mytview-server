@@ -2,7 +2,7 @@
  * Library configuration + resolution.
  *
  * A "library" is a typed root the indexer walks: a subfolder of MEDIA_ROOT with a `format`
- * (channels | series) and a default visibility for newly-seen items (`newPrivate`). Libraries are
+ * (channels | series | movies) and a default visibility for newly-seen items (`newPrivate`). Libraries are
  * OWNER-CONFIGURED in the UI (`/admin/libraries`) and stored in `state.db`, so a single `/media`
  * mount serves any number of libraries pointing at arbitrary subfolders — the media-server model,
  * not a per-volume/env convention.
@@ -16,7 +16,7 @@ import path from 'node:path';
 import { MEDIA_ROOT } from './config';
 import { stateDb } from './state';
 
-export type LibraryFormat = 'channels' | 'series';
+export type LibraryFormat = 'channels' | 'series' | 'movies';
 
 /** A resolved library the indexer walks. */
 export interface Library {
@@ -34,9 +34,11 @@ interface LibraryRow {
 	path: string;
 	format: string;
 	new_private: number;
+	show_in_recent: number;
 }
 
-const asFormat = (f: string): LibraryFormat => (f === 'series' ? 'series' : 'channels');
+const asFormat = (f: string): LibraryFormat =>
+	f === 'series' || f === 'movies' ? f : 'channels';
 
 function isDir(p: string): boolean {
 	try {
@@ -85,14 +87,28 @@ export interface LibraryConfig {
 	path: string;
 	format: LibraryFormat;
 	newPrivate: boolean;
+	/** false = this library's items stay OUT of the Recent feed (a browse-deliberately collection).
+	 *  Feed-only — search, tag/genre browsing, and the library page itself are untouched. */
+	showInRecent: boolean;
 }
+
+const toConfig = (r: LibraryRow): LibraryConfig => ({
+	id: r.id,
+	name: r.name,
+	path: r.path,
+	format: asFormat(r.format),
+	newPrivate: !!r.new_private,
+	showInRecent: !!r.show_in_recent
+});
 
 export function listLibraries(): LibraryConfig[] {
 	return (
 		stateDb()
-			.prepare('SELECT id, name, path, format, new_private FROM libraries ORDER BY name COLLATE NOCASE')
+			.prepare(
+				'SELECT id, name, path, format, new_private, show_in_recent FROM libraries ORDER BY name COLLATE NOCASE'
+			)
 			.all() as LibraryRow[]
-	).map((r) => ({ id: r.id, name: r.name, path: r.path, format: asFormat(r.format), newPrivate: !!r.new_private }));
+	).map(toConfig);
 }
 
 /** Normalise a user-entered folder to a clean MEDIA_ROOT-relative path, or null if it escapes. */
@@ -109,22 +125,38 @@ export function libraryFolderExists(relPath: string): boolean {
 }
 
 export function getLibrary(id: number): LibraryConfig | null {
-	const r = stateDb().prepare('SELECT id, name, path, format, new_private FROM libraries WHERE id = ?').get(id) as
-		| LibraryRow
-		| undefined;
-	return r ? { id: r.id, name: r.name, path: r.path, format: asFormat(r.format), newPrivate: !!r.new_private } : null;
+	const r = stateDb()
+		.prepare('SELECT id, name, path, format, new_private, show_in_recent FROM libraries WHERE id = ?')
+		.get(id) as LibraryRow | undefined;
+	return r ? toConfig(r) : null;
 }
 
-export function addLibrary(name: string, relPath: string, format: LibraryFormat, newPrivate: boolean, now = Date.now()): void {
+export function addLibrary(
+	name: string,
+	relPath: string,
+	format: LibraryFormat,
+	newPrivate: boolean,
+	showInRecent = true,
+	now = Date.now()
+): void {
 	stateDb()
-		.prepare('INSERT INTO libraries (name, path, format, new_private, created_at) VALUES (?, ?, ?, ?, ?)')
-		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, now);
+		.prepare(
+			'INSERT INTO libraries (name, path, format, new_private, show_in_recent, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+		)
+		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, showInRecent ? 1 : 0, now);
 }
 
-export function updateLibrary(id: number, name: string, relPath: string, format: LibraryFormat, newPrivate: boolean): void {
+export function updateLibrary(
+	id: number,
+	name: string,
+	relPath: string,
+	format: LibraryFormat,
+	newPrivate: boolean,
+	showInRecent = true
+): void {
 	stateDb()
-		.prepare('UPDATE libraries SET name = ?, path = ?, format = ?, new_private = ? WHERE id = ?')
-		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, id);
+		.prepare('UPDATE libraries SET name = ?, path = ?, format = ?, new_private = ?, show_in_recent = ? WHERE id = ?')
+		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, showInRecent ? 1 : 0, id);
 }
 
 export function deleteLibrary(id: number): void {

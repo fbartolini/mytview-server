@@ -6,7 +6,7 @@
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 
-	type Format = 'channels' | 'series';
+	type Format = 'channels' | 'series' | 'movies';
 	type Lib = PageData['libraries'][number];
 
 	// Add/edit form model. editId === null → "Add"; a number → editing that library.
@@ -15,6 +15,7 @@
 	let path = $state('');
 	let format = $state<Format>('channels');
 	let newPrivate = $state(false);
+	let showInRecent = $state(true);
 
 	function reset() {
 		editId = null;
@@ -22,6 +23,7 @@
 		path = '';
 		format = 'channels';
 		newPrivate = false;
+		showInRecent = true;
 		browsing = false;
 	}
 	function startEdit(l: Lib) {
@@ -30,6 +32,7 @@
 		path = l.path;
 		format = l.format;
 		newPrivate = l.newPrivate;
+		showInRecent = l.showInRecent;
 		browsing = false;
 	}
 
@@ -77,7 +80,7 @@
 
 	const input =
 		'w-full rounded border border-line bg-base-200 px-2.5 py-1.5 text-sm text-base-content focus:border-primary/70 focus:outline-none';
-	const fmtBadge = (f: Format) => (f === 'series' ? 'bg-primary/15 text-primary' : 'bg-base-300 text-muted');
+	const fmtBadge = (f: Format) => (f === 'channels' ? 'bg-base-300 text-muted' : 'bg-primary/15 text-primary');
 </script>
 
 <svelte:head><title>Libraries · MytView</title></svelte:head>
@@ -91,10 +94,11 @@
 			Point MytView at folders inside your media mount. Each library has a <b class="text-base-content"
 				>format</b
 			>
-			— <span class="text-base-content">channels</span> (videos + <code>.info.json</code>) or
-			<span class="text-base-content">series</span> (TV shows with <code>.nfo</code> + seasons) — and its
-			own default visibility for newly-found items. With none defined, the whole media folder is one public
-			channels library.
+			— <span class="text-base-content">channels</span> (videos + <code>.info.json</code>),
+			<span class="text-base-content">series</span> (TV shows with <code>.nfo</code> + seasons) or
+			<span class="text-base-content">movies</span> (film folders with <code>movie.nfo</code> + posters) —
+			and its own default visibility for newly-found items. With none defined, the whole media folder is
+			one public channels library.
 		</p>
 	</div>
 	<form method="POST" action="?/scan" use:enhance>
@@ -134,7 +138,7 @@
 					{/if}
 				</div>
 				<div class="mt-0.5 font-mono text-xs text-muted">
-					/media/{l.path} · new items {l.newPrivate ? 'private' : 'public'}
+					/media/{l.path} · new items {l.newPrivate ? 'private' : 'public'}{l.showInRecent ? '' : ' · not in Recent'}
 				</div>
 			</div>
 			<button
@@ -174,6 +178,7 @@
 			<select class={input} name="format" bind:value={format}>
 				<option value="channels">channels — videos + .info.json</option>
 				<option value="series">series — TV shows (.nfo + seasons)</option>
+				<option value="movies">movies — films (movie.nfo + posters)</option>
 			</select>
 		</label>
 	</div>
@@ -243,7 +248,13 @@
 
 	<label class="mt-3 flex items-center gap-2 text-sm text-base-content">
 		<input type="checkbox" name="newPrivate" bind:checked={newPrivate} class="accent-primary" />
-		New {format === 'series' ? 'shows' : 'channels'} in this library are private by default
+		New {format === 'series' ? 'shows' : format === 'movies' ? 'movie libraries' : 'channels'} in this library are private by default
+	</label>
+
+	<label class="mt-2 flex items-center gap-2 text-sm text-base-content">
+		<input type="checkbox" name="showInRecent" bind:checked={showInRecent} class="accent-primary" />
+		Show this library’s items in the Recent feed
+		<span class="font-mono text-[11px] text-muted">(uncheck for collections people browse deliberately — search and tags still find everything)</span>
 	</label>
 
 	<div class="mt-4 flex gap-2">

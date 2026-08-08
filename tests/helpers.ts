@@ -50,3 +50,21 @@ export function writeChannelVideo(
 	);
 	writeFileSync(path.join(dir, `${id}.mp4`), '');
 }
+
+/** Write a Radarr-style movie folder under a movies library: `<lib>/<folder>/<folder>.mkv` +
+ *  `movie.nfo` (from the given XML fields) + optional poster.jpg/fanart.jpg. */
+export function writeMovie(
+	mediaRoot: string,
+	libPath: string,
+	folder: string,
+	opts: { nfo?: string | null; poster?: boolean; fanart?: boolean; ext?: string } = {}
+): void {
+	const dir = path.join(mediaRoot, libPath, folder);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(path.join(dir, `${folder}${opts.ext ?? '.mkv'}`), 'x');
+	if (opts.nfo !== null) {
+		writeFileSync(path.join(dir, 'movie.nfo'), opts.nfo ?? '<movie><title>' + folder + '</title></movie>');
+	}
+	if (opts.poster) writeFileSync(path.join(dir, 'poster.jpg'), '');
+	if (opts.fanart) writeFileSync(path.join(dir, 'fanart.jpg'), '');
+}

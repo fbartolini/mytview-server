@@ -13,7 +13,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS channels (
     id             TEXT PRIMARY KEY,
     name           TEXT NOT NULL,
-    kind           TEXT NOT NULL DEFAULT 'channel',   -- 'channel' | 'series'
+    kind           TEXT NOT NULL DEFAULT 'channel',   -- 'channel' | 'series' | 'movies'
     library_id     INTEGER,                            -- state.db libraries.id; NULL = the default (whole-root) library
     yt_channel_id  TEXT,
     url            TEXT,
@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS videos (
     channel_id   TEXT NOT NULL,
     season_number  INTEGER,                            -- series only; NULL for channel videos
     episode_number INTEGER,                            -- series only; NULL for channel videos
+    year         INTEGER,                              -- movies only; release year for display + sort
+    poster_path  TEXT,                                 -- movies only; per-VIDEO 2:3 poster (thumb_path carries the 16:9 card art)
     title        TEXT NOT NULL,
     description  TEXT,
     upload_date  TEXT,
@@ -85,6 +87,8 @@ export function db(): Database.Database {
 	ensureColumn(d, 'channels', 'library_id', 'INTEGER'); // no index over it — filtered lists are small
 	ensureColumn(d, 'videos', 'season_number', 'INTEGER');
 	ensureColumn(d, 'videos', 'episode_number', 'INTEGER');
+	ensureColumn(d, 'videos', 'year', 'INTEGER');
+	ensureColumn(d, 'videos', 'poster_path', 'TEXT');
 	// The season index references the just-migrated columns, so it CANNOT live in SCHEMA (which runs
 	// before these ALTERs) — create it here, once the columns exist (fresh via CREATE TABLE, else ALTER).
 	d.exec('CREATE INDEX IF NOT EXISTS idx_videos_season ON videos(channel_id, season_number, episode_number)');

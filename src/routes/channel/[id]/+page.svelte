@@ -1,6 +1,9 @@
 <script lang="ts">
 	import VideoCard from '$lib/components/VideoCard.svelte';
+	import MovieCard from '$lib/components/MovieCard.svelte';
 	import { enhance } from '$app/forms';
+	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { fade } from 'svelte/transition';
 	import { flip } from 'svelte/animate';
 	import { watchUpdates } from '$lib/watchStore';
@@ -9,22 +12,55 @@
 
 	let { data }: { data: PageData } = $props();
 	const c = $derived(data.channel);
+	const isMovies = $derived(c.kind === 'movies');
 	const base = $derived(`/channel/${encodeURIComponent(c.id)}`);
 	const toggleHref = $derived(data.showWatched ? base : `${base}?watched=1`);
 	// "Show watched" is incremental: it ADDS watched videos to the unwatched ones (shows everything).
 	// The default view shows only unwatched, live-dropping a card the instant it's marked watched.
+	// Movies are the exception: the poster wall IS the collection — always everything, watched badges
+	// instead of absence (the server returns all; don't re-filter here).
 	const shown = $derived(
-		data.showWatched
+		data.showWatched || isMovies
 			? data.videos
 			: data.videos.filter((v) => !($watchUpdates[v.id]?.watched ?? v.watched ?? false))
 	);
 	// "Everything watched" in the default (unwatched-only) view — keyed off `shown` so it's right for
 	// both channels (load returns only unwatched) and series (load returns ALL episodes → filtered here).
-	const allWatched = $derived(!data.showWatched && c.video_count > 0 && shown.length === 0);
+	const allWatched = $derived(!data.showWatched && !isMovies && c.video_count > 0 && shown.length === 0);
+
+	// Movies sort — a <select> mirroring the /channels listing pages (⇔ their setSort), so the movies
+	// wall reads as a sibling LIBRARY page, not a channel detail. 'title' is the default → drop the param.
+	function setMovieSort(e: Event) {
+		const value = (e.currentTarget as HTMLSelectElement).value;
+		const url = new URL(page.url);
+		if (value === 'title') url.searchParams.delete('sort');
+		else url.searchParams.set('sort', value);
+		goto(url, { keepFocus: true, noScroll: true });
+	}
 </script>
 
 <svelte:head><title>{c.name} · MytView</title></svelte:head>
 
+{#if isMovies}
+	<!-- The movies wall IS a top-level library page (the nav tab lands here directly), so it presents
+	     like the /channels listing pages — heading + count + a sort select — not like a channel detail:
+	     no back-link (nowhere sensible to go "back" to) and no hero (a synthetic library channel has no
+	     art, which rendered as a large blank slab). -->
+	<div class="mb-5 flex items-baseline gap-3">
+		<h1 class="text-xl font-bold capitalize tracking-tight">{c.name}</h1>
+		<span class="font-mono text-xs text-faint">{c.video_count} movies</span>
+		<select
+			aria-label="Sort"
+			value={data.sort}
+			onchange={setMovieSort}
+			class="ml-auto rounded-md border border-line bg-base-200 px-2 py-1 text-xs text-muted focus:border-primary/70 focus:outline-none"
+		>
+			<option value="title">Title</option>
+			<option value="year">Year</option>
+			<option value="added">Recently added</option>
+		</select>
+	</div>
+{:else}
 <a
 	href={data.library ? `/channels?library=${data.library.id}` : '/channels'}
 	class="mb-4 inline-flex gap-1.5 font-mono text-xs text-muted hover:text-base-content"
@@ -56,7 +92,7 @@
 					<span>{fmtViews(c.follower_count)} subscribers</span>
 					<span class="text-faint">·</span>
 				{/if}
-				<span>{c.video_count} videos</span>
+				<span>{c.video_count} {isMovies ? 'movies' : 'videos'}</span>
 				{#if c.url}
 					<span class="text-faint">·</span>
 					<a href={c.url} target="_blank" rel="noopener" class="text-primary">source ↗</a>
@@ -65,7 +101,12 @@
 		</div>
 	</div>
 </div>
+{/if}
 
+{#if !isMovies}
+<!-- No action row on the movies wall: per-user feed-hide is served by the library-level "show in
+     Recent" setting (and one mis-click of "mark all watched" over ~2,000 movies is unrecoverable
+     enough to not offer). Channels/series keep the row. -->
 <div class="mb-4 flex flex-wrap items-center gap-x-4 gap-y-2">
 	<form method="POST" action="?/toggleHide" use:enhance>
 		<button class="font-mono text-xs text-muted hover:text-base-content" title="Hide/show this channel in your own Recent feed">
@@ -88,11 +129,18 @@
 		{data.showWatched ? '× hide watched' : 'show watched'}
 	</a>
 </div>
+{/if}
 
 {#if allWatched}
 	<div class="rounded-xl border border-dashed border-line p-10 text-center font-mono text-sm text-muted">
 		You’ve watched everything from this channel.
 		<a href={toggleHref} class="text-primary hover:underline">show watched</a>
+	</div>
+{:else if isMovies}
+	<div class="movie-grid">
+		{#each shown as v (v.id)}
+			<MovieCard video={v} />
+		{/each}
 	</div>
 {:else}
 	<div class="card-grid">

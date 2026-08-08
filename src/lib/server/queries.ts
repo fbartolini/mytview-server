@@ -10,6 +10,12 @@ const toSummary = (r: VideoRow): VideoSummary => ({ ...r, watched: !!r.watched }
  *  user-chosen re-sort (presentation preference, web-only for now). */
 export type ChannelSort = 'name' | 'updated' | 'unwatched';
 
+/** Movies-grid sort (contract: default 'title' — the poster-wall convention). Ignored for other kinds. */
+export type MovieSort = 'title' | 'year' | 'added';
+
+export const asMovieSort = (s: string | null): MovieSort =>
+	s === 'year' || s === 'added' ? s : 'title';
+
 export function listChannels(
 	user: { id: number } | null,
 	libraryId: number | null = null,
@@ -75,22 +81,43 @@ export function libraryCounts(user: { id: number } | null): { videos: number; ch
 	return { videos, channels };
 }
 
-export function getChannel(id: string, userId: number, showWatched = false): ChannelDetail | null {
+export function getChannel(
+	id: string,
+	userId: number,
+	showWatched = false,
+	sort: MovieSort = 'title'
+): ChannelDetail | null {
 	const channel = db().prepare('SELECT * FROM channels WHERE id = ?').get(id) as
 		| ChannelSummary
 		| undefined;
 	if (!channel) return null;
 	if (!canSeeChannel({ id: userId }, id)) return null; // private + not granted → treat as absent
+	// Movies sort user-chosen (title/year/added — the poster-wall knobs); channels/series keep the one
+	// shared order (episodes by season/episode, channel videos newest-first).
+	const orderBy =
+		channel.kind === 'movies'
+			? sort === 'year'
+				? 'v.year DESC NULLS LAST, v.title COLLATE NOCASE'
+				: sort === 'added'
+					? 'v.timestamp DESC NULLS LAST, v.title COLLATE NOCASE'
+					: 'v.title COLLATE NOCASE'
+			: 'v.season_number ASC NULLS LAST, v.episode_number ASC NULLS LAST, v.timestamp DESC NULLS LAST, v.upload_date DESC';
 	const videos = db()
 		.prepare(
-			`SELECT v.id, v.title, v.channel_id, v.season_number, v.episode_number, v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
+			`SELECT v.id, v.title, v.channel_id, v.season_number, v.episode_number, v.year, v.poster_path, v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
 			        COALESCE(w.watched, 0) AS watched, COALESCE(w.position, 0) AS position
 			 FROM videos v
 			 LEFT JOIN state.watch_state w ON w.video_id = v.id AND w.user_id = @uid
 			 WHERE v.channel_id = @cid AND (@showAll = 1 OR COALESCE(w.watched, 0) = 0)
-			 ORDER BY v.season_number ASC NULLS LAST, v.episode_number ASC NULLS LAST, v.timestamp DESC NULLS LAST, v.upload_date DESC`
+			 ORDER BY ${orderBy}`
 		)
-		.all({ uid: userId, cid: id, showAll: channel.kind === 'series' || showWatched ? 1 : 0 }) as VideoRow[];
+		.all({
+			uid: userId,
+			cid: id,
+			// Series AND movies always list everything (the collection view — watched shows a badge, not
+			// absence); the hide-watched feed behavior stays a channels-format thing.
+			showAll: channel.kind === 'series' || channel.kind === 'movies' || showWatched ? 1 : 0
+		}) as VideoRow[];
 	return { channel, videos: videos.map(toSummary) };
 }
 
@@ -129,9 +156,15 @@ export function listVideos({
 	userId,
 	showWatched = false
 }: VideoQuery): VideoSummary[] {
+	// Owner-level per-library feed opt-out (libraries.show_in_recent = 0): a collection you browse
+	// deliberately (e.g. a movies archive) stays out of Recent. FEED ONLY by design — a search (q) or a
+	// tag/genre browse still reaches everything the user can see (otherwise excluding a movies library
+	// would silently break genre pages + search for it), and library pages don't go through here at all.
+	// No q + no tag = the feed (also the related-videos top-up fill, which is feed order — desired).
+	const feed = !q && !tag;
 	const rows = db()
 		.prepare(
-			`SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number,
+			`SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number, v.year,
 			        v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
 			        COALESCE(w.watched, 0) AS watched, COALESCE(w.position, 0) AS position
 			 FROM videos v
@@ -140,6 +173,8 @@ export function listVideos({
 			 WHERE (@q IS NULL OR v.title LIKE @q)
 			   AND (@tag IS NULL OR v.id IN (SELECT video_id FROM video_tags WHERE tag = @tag))
 			   AND (@showWatched = 1 OR COALESCE(w.watched, 0) = 0)
+			   AND (@feed = 0 OR c.library_id IS NULL OR
+			        c.library_id NOT IN (SELECT id FROM state.libraries WHERE show_in_recent = 0))
 			   AND ${visibilityClause({ id: userId }, 'v.channel_id')}
 			   AND ${notHiddenClause(userId, 'v.channel_id')}
 			 ORDER BY v.timestamp DESC NULLS LAST, v.upload_date DESC
@@ -150,6 +185,7 @@ export function listVideos({
 			q: q ? `%${q}%` : null,
 			tag: tag ?? null,
 			showWatched: showWatched ? 1 : 0,
+			feed: feed ? 1 : 0,
 			limit,
 			offset
 		}) as VideoRow[];
@@ -262,6 +298,9 @@ export function relatedVideos(videoId: string, userId: number, limit = 8): Video
 	// unwatched top-up below is ONLY for untagged channel videos, never for series.
 	const series = seriesRelated(videoId, userId, limit);
 	if (series !== null) return series;
+	// A movie's "more like this" is OTHER MOVIES, never channel videos or a feed top-up.
+	const movies = moviesRelated(videoId, userId, limit);
+	if (movies !== null) return movies;
 	// Non-series: tag-overlap, topped up with recent unwatched (feed order) so autoplay never dead-ends
 	// on a video whose creator added no tags.
 	const related = tagRelated(videoId, userId, limit);
@@ -287,7 +326,7 @@ function seriesRelated(videoId: string, userId: number, limit: number): VideoSum
 	if (!cur || cur.kind !== 'series') return null;
 	const rows = db()
 		.prepare(
-			`SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number,
+			`SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number, v.year,
 			        v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
 			        COALESCE(w.watched, 0) AS watched, COALESCE(w.position, 0) AS position
 			 FROM videos v
@@ -299,6 +338,51 @@ function seriesRelated(videoId: string, userId: number, limit: number): VideoSum
 			 LIMIT @limit`
 		)
 		.all({ uid: userId, sid: cur.sid, id: videoId, s: cur.s, e: cur.e, limit }) as VideoRow[];
+	return rows.map(toSummary);
+}
+
+/**
+ * "More like this" for a MOVIE: other movies from the same library (= channel), ranked by
+ * idf-weighted GENRE overlap with year-proximity as the tiebreak. Deliberate differences from
+ * tagRelated: (1) movies only — the generic matcher's same-channel penalty actually DEMOTED other
+ * movies (they all share the synthetic channel) in favour of any channel video sharing a broad
+ * genre word, then topped up with feed videos; (2) WATCHED INCLUDED — the rail is navigational
+ * (movies never autoplay-chain) and a collection hides nothing; (3) zero-overlap movies still fill
+ * the rail by year proximity, so it never comes back empty. Same-channel ⇒ same visibility as the
+ * source video the caller already authorized. Returns null when the video isn't a movie.
+ */
+function moviesRelated(videoId: string, userId: number, limit: number): VideoSummary[] | null {
+	const cur = db()
+		.prepare(
+			`SELECT v.channel_id AS cid, v.year AS year, v.tags AS tags, c.kind AS kind
+			 FROM videos v JOIN channels c ON c.id = v.channel_id WHERE v.id = ?`
+		)
+		.get(videoId) as { cid: string; year: number | null; tags: string; kind: string } | undefined;
+	if (!cur || cur.kind !== 'movies') return null;
+	const rows = db()
+		.prepare(
+			`WITH src(tag) AS (SELECT value FROM json_each(@tags)),
+			      df(tag, n) AS (
+			        SELECT tag, COUNT(DISTINCT video_id) AS n
+			        FROM video_tags WHERE tag IN (SELECT tag FROM src) GROUP BY tag
+			      ),
+			      score(video_id, s) AS (
+			        SELECT vt.video_id, SUM(1.0 / df.n) FROM video_tags vt JOIN df ON df.tag = vt.tag GROUP BY vt.video_id
+			      )
+			 SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number, v.year,
+			        v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
+			        COALESCE(w.watched, 0) AS watched, COALESCE(w.position, 0) AS position
+			 FROM videos v
+			 JOIN channels c ON c.id = v.channel_id
+			 LEFT JOIN state.watch_state w ON w.video_id = v.id AND w.user_id = @uid
+			 LEFT JOIN score s ON s.video_id = v.id
+			 WHERE v.channel_id = @cid AND v.id != @id
+			 ORDER BY COALESCE(s.s, 0) DESC,
+			          ABS(COALESCE(v.year, 9999) - COALESCE(@year, 9999)) ASC,
+			          v.title COLLATE NOCASE
+			 LIMIT @limit`
+		)
+		.all({ tags: cur.tags || '[]', uid: userId, cid: cur.cid, id: videoId, year: cur.year, limit }) as VideoRow[];
 	return rows.map(toSummary);
 }
 
@@ -324,7 +408,7 @@ function tagRelated(videoId: string, userId: number, limit: number): VideoSummar
 			        WHERE tag IN (SELECT tag FROM src)
 			        GROUP BY tag
 			      )
-			 SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number,
+			 SELECT v.id, v.title, v.channel_id, c.name AS channel_name, v.season_number, v.episode_number, v.year,
 			        v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
 			        COALESCE(w.watched, 0) AS watched, COALESCE(w.position, 0) AS position
 			 FROM video_tags vt
@@ -354,12 +438,17 @@ function tagRelated(videoId: string, userId: number, limit: number): VideoSummar
 export function getVideo(id: string): VideoDetail | null {
 	const v = db()
 		.prepare(
-			`SELECT v.*, c.name AS channel_name FROM videos v
+			`SELECT v.*, c.name AS channel_name, c.kind AS channel_kind FROM videos v
 			 JOIN channels c ON c.id = v.channel_id WHERE v.id = ?`
 		)
 		.get(id) as (Record<string, unknown> & { tags?: string; chapters?: string }) | undefined;
 	if (!v) return null;
-	v.tags = v.tags ? JSON.parse(v.tags) : [];
+	// Namespaced entries (person:/set: — movie relatedness signals, see indexer.buildMovieRow) are
+	// index-internal: strip them so no client ever renders them as tag chips.
+	const parsed: unknown = v.tags ? JSON.parse(v.tags) : [];
+	v.tags = (Array.isArray(parsed) ? parsed : []).filter(
+		(t): t is string => typeof t === 'string' && !/^(person|set):/.test(t)
+	) as never;
 	v.chapters = v.chapters ? JSON.parse(v.chapters) : [];
 	return v as unknown as VideoDetail;
 }

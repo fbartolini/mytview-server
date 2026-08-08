@@ -1,15 +1,15 @@
 <script lang="ts">
 	import type { VideoSummary } from '$lib/types';
-	import { fmtDuration, fmtViews, fmtDate, fmtEpisode } from '$lib/format';
 	import { watchUpdates, noteWatch } from '$lib/watchStore';
 
-	let { video, showChannel = true }: { video: VideoSummary; showChannel?: boolean } = $props();
+	// The poster-wall cell for a movies library (2:3, ⇔ every movie UI's convention) — the poster
+	// sibling of VideoCard's 16:9 thumb cell. Title + year below; same watched overlay/progress/toggle
+	// affordances as VideoCard so watch state reads identically across grid shapes.
+	let { video }: { video: VideoSummary } = $props();
 
-	// Fall back to the placeholder if the thumb file 404s (e.g. a just-pulled video whose image
-	// hasn't landed yet, or one being re-processed) instead of the browser's broken-image icon.
 	let imgError = $state(false);
 
-	// Overlay any in-session change from the player over the SSR values.
+	// Overlay any in-session change from the player over the SSR values (⇔ VideoCard).
 	const patch = $derived($watchUpdates[video.id]);
 	const watched = $derived(patch?.watched ?? video.watched ?? false);
 	const position = $derived(patch?.position ?? video.position ?? 0);
@@ -17,12 +17,6 @@
 		position && video.duration ? Math.min(100, (position / video.duration) * 100) : 0
 	);
 
-	// Series episodes carry no view count (the .nfo has none) — that stat slot renders "— views".
-	// When we have a season/episode, show the episode label there instead; else keep views.
-	const epLabel = $derived(fmtEpisode(video.season_number, video.episode_number));
-
-	// Mark watched/unwatched straight from the card — no need to open the video. Optimistic via the
-	// shared store, persisted to the same endpoint the detail page uses.
 	function toggleWatched(e: MouseEvent) {
 		e.preventDefault(); // this button lives inside the card's <a> — don't navigate
 		e.stopPropagation();
@@ -42,12 +36,11 @@
 	href="/video/{encodeURIComponent(video.id)}"
 	class="group block rounded-lg outline-offset-2 focus-visible:outline-2 focus-visible:outline-primary/70"
 >
-	<div class="relative aspect-video overflow-hidden rounded-lg border border-line-soft bg-base-300">
-		{#if video.thumb_path && !imgError}
-			<!-- Watched thumbs dim so unwatched pops when "show watched" is on (full again on hover). -->
+	<div class="relative aspect-[2/3] overflow-hidden rounded-lg border border-line-soft bg-base-300">
+		{#if video.poster_path && !imgError}
 			<img
 				loading="lazy"
-				src="/thumb/{encodeURIComponent(video.id)}"
+				src="/poster/{encodeURIComponent(video.id)}"
 				alt=""
 				onerror={() => (imgError = true)}
 				class="h-full w-full object-cover transition-[transform,opacity,filter] duration-300 group-hover:scale-[1.03] group-hover:brightness-[1.06] {watched
@@ -55,14 +48,10 @@
 					: ''}"
 			/>
 		{:else}
-			<div class="grid h-full place-items-center font-mono text-xs text-faint">no thumbnail</div>
-		{/if}
-		{#if video.duration}
-			<span
-				class="absolute right-1.5 bottom-1.5 rounded bg-black/80 px-1.5 py-0.5 font-mono text-[11px] leading-none text-neutral-100"
-			>
-				{fmtDuration(video.duration)}
-			</span>
+			<!-- No poster: the title becomes the tile (⇔ ChannelCard's initial-letter fallback). -->
+			<div class="grid h-full place-items-center p-3 text-center font-mono text-xs text-faint">
+				{video.title}
+			</div>
 		{/if}
 		{#if watched}
 			<span
@@ -88,23 +77,10 @@
 			</svg>
 		</button>
 	</div>
-	<div class="pt-2.5">
-		<div class="line-clamp-2 text-[13.5px] leading-snug font-medium">{video.title}</div>
-		<div class="mt-1.5 flex flex-wrap items-center gap-1.5 font-mono text-[11.5px] text-muted">
-			{#if showChannel && video.channel_name}
-				<span class="text-base-content">{video.channel_name}</span>
-				<span class="text-faint">·</span>
-			{/if}
-			<span>{fmtDate(video.timestamp, video.upload_date)}</span>
-			<span class="text-faint">·</span>
-			{#if epLabel}
-				<span class="text-base-content">{epLabel}</span>
-			{:else if video.year}
-				<!-- Movies: the release year is the meaningful stat (they carry no view count). -->
-				<span class="text-base-content">{video.year}</span>
-			{:else}
-				<span>{fmtViews(video.view_count)} views</span>
-			{/if}
-		</div>
+	<div class="pt-2">
+		<div class="line-clamp-1 text-[13px] leading-snug font-medium">{video.title}</div>
+		{#if video.year}
+			<div class="mt-0.5 font-mono text-[11px] text-muted">{video.year}</div>
+		{/if}
 	</div>
 </a>

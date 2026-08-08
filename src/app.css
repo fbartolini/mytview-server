@@ -82,4 +82,11 @@
 		   card, and desktop packs more per row. */
 		grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr));
 	}
+	.movie-grid {
+		display: grid;
+		gap: 16px;
+		/* The poster wall: 2:3 tiles pack tighter than 16:9 cards — a ~160px min gives
+		   ~2 columns on phones and a dense wall on desktop (⇔ Plex/Jellyfin density). */
+		grid-template-columns: repeat(auto-fill, minmax(min(160px, 100%), 1fr));
+	}
 }

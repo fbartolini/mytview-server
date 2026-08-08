@@ -96,7 +96,7 @@
 				watch={data.watch}
 				watchedAt={data.watchedAt}
 				resumePosition={data.resumePosition}
-				autoplayNext={data.prefs.autoplayNext}
+				autoplayNext={data.prefs.autoplayNext && v.channel_kind !== 'movies'}
 				stillWatchingAfter={data.prefs.stillWatchingAfter}
 				preferCompat={data.preferCompat}
 				hlsEnabled={data.hlsEnabled}
@@ -111,10 +111,17 @@
 				href="/channel/{encodeURIComponent(v.channel_id)}"
 				class="text-base-content hover:text-primary">{v.channel_name}</a
 			>
-			<span class="text-faint">·</span><span>{fmtDate(v.timestamp, v.upload_date)}</span>
-			<span class="text-faint">·</span><span>{fmtViews(v.view_count)} views</span>
-			{#if v.like_count != null}
-				<span class="text-faint">·</span><span>{fmtViews(v.like_count)} likes</span>
+			{#if v.channel_kind === 'movies'}
+				<!-- A movie's facts: release year (its timestamp is the ADDED date — feed ordering, not
+				     display) and runtime. No views/likes — film NFOs carry neither. -->
+				{#if v.year}<span class="text-faint">·</span><span>{v.year}</span>{/if}
+				{#if v.duration}<span class="text-faint">·</span><span>{fmtDuration(v.duration)}</span>{/if}
+			{:else}
+				<span class="text-faint">·</span><span>{fmtDate(v.timestamp, v.upload_date)}</span>
+				<span class="text-faint">·</span><span>{fmtViews(v.view_count)} views</span>
+				{#if v.like_count != null}
+					<span class="text-faint">·</span><span>{fmtViews(v.like_count)} likes</span>
+				{/if}
 			{/if}
 		</div>
 

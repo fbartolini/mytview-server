@@ -19,18 +19,19 @@ export const load: PageServerLoad = ({ locals }) => {
 	return { libraries };
 };
 
-type Parsed = { name: string; path: string; format: LibraryFormat; newPrivate: boolean };
+type Parsed = { name: string; path: string; format: LibraryFormat; newPrivate: boolean; showInRecent: boolean };
 
 /** Validate the shared add/edit fields; returns the parsed values or a user-facing error string. */
 function parseForm(data: FormData): Parsed | { error: string } {
 	const name = String(data.get('name') ?? '').trim();
 	const format = String(data.get('format') ?? '');
 	const newPrivate = data.get('newPrivate') != null; // checkbox only submits when checked
+	const showInRecent = data.get('showInRecent') != null;
 	if (!name) return { error: 'Name is required.' };
-	if (format !== 'channels' && format !== 'series') return { error: 'Pick a format.' };
+	if (format !== 'channels' && format !== 'series' && format !== 'movies') return { error: 'Pick a format.' };
 	const path = normalizeLibraryPath(String(data.get('path') ?? ''));
 	if (path == null) return { error: 'That folder is outside the media root.' };
-	return { name, path, format, newPrivate };
+	return { name, path, format, newPrivate, showInRecent };
 }
 
 export const actions: Actions = {
@@ -39,7 +40,7 @@ export const actions: Actions = {
 		const p = parseForm(await request.formData());
 		if ('error' in p) return fail(400, { error: p.error });
 		try {
-			addLibrary(p.name, p.path, p.format, p.newPrivate);
+			addLibrary(p.name, p.path, p.format, p.newPrivate, p.showInRecent);
 		} catch {
 			return fail(400, { error: 'Another library already uses that folder.' }); // UNIQUE(path)
 		}
@@ -55,7 +56,7 @@ export const actions: Actions = {
 		const p = parseForm(data);
 		if ('error' in p) return fail(400, { error: p.error });
 		try {
-			updateLibrary(id, p.name, p.path, p.format, p.newPrivate);
+			updateLibrary(id, p.name, p.path, p.format, p.newPrivate, p.showInRecent);
 		} catch {
 			return fail(400, { error: 'Another library already uses that folder.' });
 		}

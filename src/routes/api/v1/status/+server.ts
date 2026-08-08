@@ -23,6 +23,6 @@ export const GET: RequestHandler = ({ locals }) => {
 		// show serverVersion in diagnostics) instead of probing endpoints and guessing from 404s. New
 		// server features append a name here; nothing is ever removed once shipped.
 		serverVersion: SERVER_VERSION,
-		capabilities: ['libraries', 'series', 'sessions', 'prefs', 'shares', ...(hlsEnabled() ? ['hls'] : [])]
+		capabilities: ['libraries', 'series', 'movies', 'sessions', 'prefs', 'shares', ...(hlsEnabled() ? ['hls'] : [])]
 	});
 };

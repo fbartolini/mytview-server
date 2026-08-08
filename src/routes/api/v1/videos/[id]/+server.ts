@@ -55,9 +55,12 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	const watch = getWatch(locals.user.id, video.id);
 	// Server-owned watch decisions so every client seeks/marks identically (see watch.ts).
 	return json({
-		...video,
+		...video, // includes channel_kind — 'movies' tells clients NOT to autoplay-chain (contract §Movies)
 		directPlay,
 		isVertical,
+		// Movies only — the signed 2:3 poster for the detail screen (thumb/playback.poster stay the
+		// 16:9 fanart, which is what the player backdrop wants). Null for channel videos/episodes.
+		posterUrl: video.poster_path ? signedPath('poster', video.id) : null,
 		// A Matroska container can't be demuxed by AVPlayer at all (whatever the codec), so an Apple client
 		// should START on the fallback (compat/HLS) instead of eating a guaranteed decode failure + stall on
 		// every episode. Factual signal (⇔ isVertical); other clients (ExoPlayer/Tizen play .mkv) ignore it.

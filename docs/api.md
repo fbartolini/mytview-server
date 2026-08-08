@@ -136,7 +136,8 @@ body `{ autoplayNext?, stillWatchingAfter? }` → `{ prefs: { … } }`. Server-o
 are **visibility-filtered**. Use `everScanned=false || scanning` to show an "indexing" state vs "empty";
 poll (~30s) to auto-refresh the feed when a background scan finishes. `transcoding` is legacy (always 0).
 **`capabilities`** (added 0.4.0) is the version-negotiation surface: an additive-only string list —
-currently `libraries | series | sessions | prefs | shares` (+ `hls` when live transcode is enabled).
+currently `libraries | series | movies | sessions | prefs | shares` (+ `hls` when live transcode is
+enabled).
 Feature-gate on membership (absent field = pre-0.4.0 server: assume all of the above except judge `hls`
 by `playback.hlsUrl != null`); never probe endpoints and guess from 404s. `serverVersion` is for
 diagnostics display, not gating.
@@ -144,14 +145,22 @@ diagnostics display, not gating.
 ### `GET /api/v1/videos?offset=&limit=&watched=&q=&tag=`
 `{ items: [VideoSummary], page: { limit, offset, nextOffset } }` — `nextOffset` null = end.
 `watched=1` includes watched videos (incremental; default hides them). `q` = title search, `tag` = tag filter.
+The owner can opt a LIBRARY out of the feed (`show_in_recent` on /admin/libraries — collections people
+browse deliberately, e.g. a movies archive): the plain feed silently omits it, while `q`/`tag` queries and
+the library's own pages still include everything. Enforced server-side — clients need no logic.
 **VideoSummary:** `{ id, title, channel_id, channel_name, upload_date, timestamp, duration, view_count,
-thumb_path, season_number, episode_number, watched, position, directPlay, isVertical, thumb }` (`thumb` =
-signed). `season_number`/`episode_number` are null except for **series episodes** — render them as the
-`fmtEpisode` label (see Client responsibilities), e.g. `S1·E2`.
+thumb_path, season_number, episode_number, year, watched, position, directPlay, isVertical, thumb }`
+(`thumb` = signed). `season_number`/`episode_number` are null except for **series episodes** — render them
+as the `fmtEpisode` label (see Client responsibilities), e.g. `S1·E2`. **`year`** is null except for
+**movies** — render it in the meta slot where a channel video shows views (movies have no view count).
 
 ### `GET /api/v1/videos/[id]`  — one round-trip for the player screen
 `VideoSummary` fields **plus**: `description, like_count, width, height, fps, vcodec, acodec, tags[],
 chapters: [{ start_time, end_time, title }], webpage_url`, and the server-owned:
+- `channel_kind` — the owning channel's kind (`channel | series | movies`). **The movies rule hangs off
+  this: `movies` → do NOT autoplay-chain** (see §Movies below).
+- `posterUrl` — signed 2:3 poster, **movies only** (null elsewhere). `playback.poster`/`thumb` stay the
+  16:9 fanart — that's what the player backdrop wants; `posterUrl` is for the detail screen's poster.
 - `isVertical` — portrait? (letterbox on a 16:9 screen)
 - `playback: { kind, url, compatUrl, hlsUrl, mimeType, poster, canTranscode }` — the **fail-open** play descriptor
   (below). `url` (signed original) is **always** present; you always try it first.
@@ -162,19 +171,46 @@ chapters: [{ start_time, end_time, title }], webpage_url`, and the server-owned:
 ### `GET /api/v1/channels?library=`
 `{ items: [Channel] }`. **Channel:** `{ id, name, kind, library_id, yt_channel_id, url, follower_count,
 poster_path, fanart_path, video_count, unwatched, poster, fanart, isHidden }` (`poster`/`fanart` = signed;
-`isHidden` = this user unsubscribed). **`kind`** ∈ `channel | series`. **`unwatched`** = per-user count of
-not-watched items → render as an unread-style **badge**. **`library_id`** = the owning library (null = the
-implicit default). Optional **`?library=<id>`** scopes the list to one library (mirrors the web nav tabs).
+`isHidden` = this user unsubscribed). **`kind`** ∈ `channel | series | movies`. **`unwatched`** = per-user
+count of not-watched items → render as an unread-style **badge**. **`library_id`** = the owning library
+(null = the implicit default). Optional **`?library=<id>`** scopes the list to one library (mirrors the
+web nav tabs).
 
-### `GET /api/v1/channels/[id]?watched=`
+### `GET /api/v1/channels/[id]?watched=&sort=`
 `{ channel: Channel, videos: [VideoSummary], nextEpisode: VideoSummary | null }`. A **series**
 (`channel.kind === "series"`) returns **all** its episodes in season/episode order (watched ones included),
 and `nextEpisode` is the server-owned "continue" pointer (first unwatched episode, or null when the show is
-finished). A flat channel returns newest-first with `nextEpisode: null`.
+finished). A flat channel returns newest-first with `nextEpisode: null`. A **movies** channel returns all
+its movies (watched included, like series) with `nextEpisode: null`; **`?sort=title|year|added`** (movies
+only, default `title` — the poster-wall convention; server-ordered, don't re-sort client-side) and each
+item additionally carries a signed **`poster`** (2:3) next to `thumb` (16:9 fanart).
+
+## §Movies (added 0.4.x — capability `movies`)
+
+A movies library is ONE synthetic channel (`kind='movies'`, id `movies:<libraryId>`, named after the
+library). The rules every client mirrors:
+- **Grid shape:** a movies channel renders as a **2:3 poster wall** (use each item's `poster`, falling
+  back to title-on-tile), NOT the 16:9 card grid. Everywhere else movies appear (Recent, search, related)
+  they stay normal 16:9 cards — the server puts the FANART in `thumb` so this needs no client logic.
+- **Meta line:** year in the slot where channel videos show views; movies have no views/likes/SxE.
+- **NO autoplay-chain:** when `channel_kind === 'movies'`, do not auto-advance at end of playback —
+  show the end state (and the Related rail) instead. Watching a film must not slingshot into another
+  one.
+- **Related for a movie = OTHER MOVIES only** (server-owned; clients just render `/api/v1/related`):
+  same library, ranked by idf-weighted overlap of **genres + top-billed cast (≤5) + director +
+  collection** (the latter three indexed as namespaced `person:`/`set:` tag entries — the weighting
+  naturally ranks shared-collection ≫ shared-person ≫ shared-genre), year-proximity tiebreak,
+  **watched included** (the rail is navigational — a collection hides nothing), zero-overlap movies
+  fill by year proximity so the rail is never empty. Never channel videos, never a feed top-up.
+  Detail `tags[]` never contains the namespaced entries — clients only ever see genres.
+- **Navigation:** a movies library's nav tab goes STRAIGHT to its poster wall (the synthetic channel),
+  not to a channels page listing one tile.
+- Everything else (watch state, resume, playback descriptor, HLS fail-open, visibility) is identical —
+  a movie is a video row.
 
 ### `GET /api/v1/libraries`
 `{ items: [{ id, name, format }] }` — the libraries **this user can see media in** (`format` ∈
-`channels | series`), for per-library nav/tabs. A library with no channel visible to the user, or no media
+`channels | series | movies`), for per-library nav/tabs. A library with no channel visible to the user, or no media
 at all (regardless of watched state), is **omitted**. **Empty array** when none are configured or none are
 visible → show a single "Channels" tab. Not access control — the channels within each library are
 visibility-filtered by the reads above; this just hides an empty/all-private library from the nav.
@@ -270,6 +306,29 @@ shipped client may still map them, a new client will never see them.)
 
 ---
 
+## The playback guarantee — ONE criterion, every platform
+
+Every client makes the same promise: **every item plays — direct when the device can decode it, live
+HLS when it can't — and "can't" must NEVER be silent.** The policy is identical everywhere:
+
+1. Attempt the original `url`.
+2. Detect failure — **including the silent failures that raise no player error.**
+3. Walk the fallback ladder to `hlsUrl` (universal — present for every id).
+
+Only the step-2 DETECTOR is per-platform, because each player signals differently. A library can
+never "behave differently" from another: libraries only differ in codec population (ytdl H.264/AAC
+vs Radarr DV/HEVC-10bit remuxes) — this guarantee makes the outcome uniform regardless.
+
+| Platform | error signal | silent-failure detector |
+| --- | --- | --- |
+| Web (Chrome `<video>`) | MediaError → fallback | SERVER-side: `preferCompat` starts mkv / AC-3-family audio on HLS (`webPrefersCompat`) — Chrome would play the video and silently drop that audio, raising nothing |
+| Apple (AVPlayer) | item `.failed` → ladder | `isMkv` hint → start on the fallback rung (AVPlayer can't demux Matroska at all, and stalls rather than erroring usefully); PLUS a per-load `AVAssetTrack.isDecodable` probe — a direct file with video/audio tracks of which the device can decode none (DV/10-bit mp4 → audio + black screen, no `.failed`) walks the same ladder |
+| Android (ExoPlayer) | `PlaybackException` 3xxx/4xxx → ladder | `onTracksChanged`: the media contains a video/audio track type of which the device supports NO track (DV / HEVC-10bit → audio-only; DTS → silent video) → treated exactly as a decode failure |
+| Tizen (HTML5 `<video>`) | MediaError → ladder | none known needed — the sets decode nearly everything; add one here the day a silent case is observed |
+
+New silent-failure classes get a detector at whichever layer holds the truth (device capability →
+client; container/codec knowledge → server hint), never a per-library or per-kind branch.
+
 ## Client responsibilities (mirror these — this is where clients drift)
 
 - **Session:** persist base URL + token in secure storage (Keychain / Keystore / equivalent); attach the
@@ -331,3 +390,43 @@ shipped client may still map them, a new client will never see them.)
 ### Out of scope for a TV client (deliberately)
 Sharing, owner-admin (channel visibility / invites — web punch-out), offline downloads, and **direct
 username/password login** (TV uses device-code pairing). See `docs/feature-platform-matrix.md`.
+
+## Monetization gate (paid native clients — client-local BY DESIGN)
+
+The unlock is deliberately **client + store only**: no license server, no server involvement, no server
+API — the self-hosted design has no central identity to key one on, and the GPL server stays fully free.
+This section exists because the constants are a cross-client contract (Swift/Kotlin can't share code);
+mirror them exactly. Implementations: `apple/MytViewKit/Sources/MytViewKit/PurchaseStore.swift`,
+`android/core/src/main/kotlin/com/mytview/core/billing/EntitlementStore.kt`.
+
+| Constant | Value | Notes |
+|---|---|---|
+| `PAID_CUTOFF` | **2026-11-01T00:00:00Z** (epoch `1793491200`) | One date, two roles: when charging starts AND the founder-grandfather cutoff. Comparison is strict `<` (an install exactly at the cutoff is not a founder). |
+| `TRIAL_DAYS` | **14** | Whole elapsed days from first launch; day 0 shows "14 days left". |
+| Apple product id | `com.mytview.app.unlock` | Non-consumable; one purchase covers iPhone + iPad + Apple TV (universal app). Permanent once used — never rename. |
+| Play product id | `full_unlock` | One-time product; covers phone + tablet + Google TV (one package). Permanent once used — never rename. |
+
+**States** (both platforms, same names): `unknown → founder | purchased | trial(daysLeft) | expired`.
+Resolution order, most-authoritative first: owned purchase → store-signed first-download evidence →
+local first-launch stamp. State only ever upgrades toward unlocked as better evidence loads.
+
+**Founder evidence per platform** (the deliberate asymmetry): Apple reads
+`AppTransaction.originalPurchaseDate` (Apple-signed — survives reinstall, new devices, and updating
+months after the cutoff), falling back to a Keychain first-launch stamp offline. Android has no signed
+equivalent: `PackageInfo.firstInstallTime` (survives updates) OR a persisted founder flag OR first
+launch before the cutoff — leaky-but-layered is the accepted trade-off, with Play promo codes as the
+manual net. First-launch-before-cutoff counts as founder everywhere (you can't run what you haven't
+downloaded).
+
+**What gates: playback session START only.** The gate sits on the Play action (the single play entry
+point per client); autoplay-next advances inside an already-running session and is deliberately NOT
+re-gated — an expired trial can finish its current binge chain but can't start a new one. Browse,
+search, pairing, and Settings never gate (the app must always demo itself, and review must always be
+able to reach the paywall). **Fail-open:** `unknown` (store unreachable) never blocks playback — only a
+positively expired trial does.
+
+**Purchase reachability:** the paywall is reachable from Settings in EVERY state — pre-cutoff that's
+how store review finds the IAP at all (nothing else surfaces it before Nov 1), and how founders tip.
+
+**Who never gates:** the web player (self-hosted, always free) and the Samsung TV (Tizen) client —
+free by design as the funnel; its Settings footer points at the paid mobile apps instead.

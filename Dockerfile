@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage: full toolchain (better-sqlite3 may compile a native addon) ----
-FROM node:24-trixie AS build
+# PINNED to an exact Node release — never a floating major tag. 2026-08-08: a routine CI rebuild
+# pulled the freshly-rolled node:24-trixie (Node 24.19.0, released 08-03) and the server crash-looped
+# with a native abort in better-sqlite3's statement finalizer (`RemoveEnvironmentCleanupHook:
+# Assertion failed: (env) != nullptr`) — no JS stack, nothing to catch. Same ABI (137), so the
+# binding loads and then dies. A base-image bump must be a DELIBERATE, tested change (edit both
+# stages together + verify boot against a populated /data), not a side effect of rebuilding.
+FROM node:24.18.1-trixie AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -15,7 +21,7 @@ RUN npm run build \
 # (e.g. Alder Lake-N, which needs i915.force_probe) with an "Input/output error"; trixie ships
 # iHD ~25.x — the same driver a working Plex LXC uses on the same hosts. The container carries
 # its own VA driver, so this is independent of whatever the PVE host has installed.
-FROM node:24-trixie-slim AS runtime
+FROM node:24.18.1-trixie-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

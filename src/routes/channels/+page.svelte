@@ -8,7 +8,9 @@
 
 	// When scoped to a library, the heading is its name and the count noun matches its format.
 	const heading = $derived(data.library ? data.library.name : 'Channels');
-	const noun = $derived(data.library?.format === 'series' ? 'shows' : 'channels');
+	const noun = $derived(
+		data.library?.format === 'series' ? 'shows' : data.library?.format === 'movies' ? 'movies' : 'channels'
+	);
 
 	// Re-sort in place, preserving ?library. 'name' is the default → drop the param to keep URLs clean.
 	function setSort(e: Event) {

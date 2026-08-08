@@ -153,8 +153,9 @@ CREATE TABLE IF NOT EXISTS libraries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
     path        TEXT NOT NULL UNIQUE,       -- MEDIA_ROOT-relative subfolder ('' = the root itself)
-    format      TEXT NOT NULL,              -- 'channels' | 'series'
+    format      TEXT NOT NULL,              -- 'channels' | 'series' | 'movies'
     new_private INTEGER NOT NULL DEFAULT 0, -- newly-seen channels/shows here default to private?
+    show_in_recent INTEGER NOT NULL DEFAULT 1, -- 0 = this library's items stay OUT of the Recent feed (collections)
     created_at  INTEGER NOT NULL
 );
 `;
@@ -177,6 +178,10 @@ export function stateDb(): Database.Database {
 	// Account deactivation (owner can suspend a login without deleting its watch state). NULL = active;
 	// a timestamp = suspended. Login is rejected while set; see auth.ts and the login routes.
 	addColumnIfMissing(d, 'users', 'deactivated_at', 'INTEGER');
+	// Per-library feed opt-out (owner): 0 keeps the library's items out of Recent — a collection you
+	// browse deliberately (movies archive) rather than a feed. Gates ONLY the feed (queries.listVideos);
+	// search/tags/library pages are untouched. Default 1 = current behavior.
+	addColumnIfMissing(d, 'libraries', 'show_in_recent', 'INTEGER NOT NULL DEFAULT 1');
 	_state = d;
 	return _state;
 }

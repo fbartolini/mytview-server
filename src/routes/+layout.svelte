@@ -187,10 +187,14 @@
 			>
 			{#if data.libraries.length > 0}
 				<!-- One tab per configured library → /channels?library=<id>. Names are usually lowercase
-				     ("shows"), so capitalize for a tidy tab without mutating the stored name. -->
+				     ("shows"), so capitalize for a tidy tab without mutating the stored name. A MOVIES
+				     library goes STRAIGHT to its poster wall (the one synthetic movies:<id> channel) —
+				     a channels page listing a single tile would be a pointless hop. -->
 				{#each data.libraries as lib (lib.id)}
 					<a
-						href="/channels?library={lib.id}"
+						href={lib.format === 'movies'
+							? `/channel/${encodeURIComponent('movies:' + lib.id)}`
+							: `/channels?library=${lib.id}`}
 						class="rounded-md px-2 py-1.5 text-[13px] font-medium capitalize transition-colors hover:bg-base-200 sm:px-3 {currentLib ===
 						String(lib.id)
 							? 'text-base-content'

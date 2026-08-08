@@ -3,8 +3,9 @@
 export interface ChannelSummary {
 	id: string;
 	name: string;
-	/** 'channel' (flat videos) | 'series' (seasons/episodes). */
-	kind: 'channel' | 'series';
+	/** 'channel' (flat videos) | 'series' (seasons/episodes) | 'movies' (one synthetic channel = the
+	 *  whole movies library; its videos carry `year` + a 2:3 poster). */
+	kind: 'channel' | 'series' | 'movies';
 	yt_channel_id: string | null;
 	url: string | null;
 	follower_count: number | null;
@@ -32,6 +33,11 @@ export interface VideoSummary {
 	/** Series episodes only; NULL/omitted for channel videos. */
 	season_number?: number | null;
 	episode_number?: number | null;
+	/** Movies only — release year (card meta line + the movies grid's year sort). */
+	year?: number | null;
+	/** Movies only — the 2:3 poster (served by /poster/[videoId]); selected by getChannel so the
+	 *  movies grid can render the poster wall. NULL/omitted elsewhere. */
+	poster_path?: string | null;
 	watched?: boolean;
 	position?: number;
 	/** H.264 + AAC — plays on restrictive native TV players (AVPlayer/AVPlay) without
@@ -67,6 +73,12 @@ export interface VideoDetail {
 	thumb_path: string | null;
 	season_number?: number | null;
 	episode_number?: number | null;
+	/** Movies only. */
+	year?: number | null;
+	poster_path?: string | null;
+	/** The owning channel's kind — how clients tell a movie from an episode from a channel video
+	 *  (drives the no-autoplay-chain rule for movies; see api-client-contract §Movies). */
+	channel_kind?: 'channel' | 'series' | 'movies';
 }
 
 export interface ChannelDetail {

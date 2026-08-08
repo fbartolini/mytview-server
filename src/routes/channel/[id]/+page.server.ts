@@ -1,5 +1,5 @@
 import { error } from '@sveltejs/kit';
-import { getChannel } from '$lib/server/queries';
+import { getChannel, asMovieSort } from '$lib/server/queries';
 import { getLibrary } from '$lib/server/libraries';
 import { isChannelHidden, setChannelHidden } from '$lib/server/visibility';
 import { setChannelWatched } from '$lib/server/watch';
@@ -8,13 +8,15 @@ import type { Actions, PageServerLoad } from './$types';
 export const load: PageServerLoad = ({ params, url, locals }) => {
 	if (!locals.user) throw error(401);
 	const showWatched = url.searchParams.get('watched') === '1';
-	const data = getChannel(params.id, locals.user.id, showWatched);
+	const sort = asMovieSort(url.searchParams.get('sort')); // movies grid only; ignored for other kinds
+	const data = getChannel(params.id, locals.user.id, showWatched, sort);
 	if (!data) throw error(404, 'Channel not found');
 	// The library this channel belongs to → the back link returns to that library's grid (else "channels").
 	const lib = data.channel.library_id != null ? getLibrary(data.channel.library_id) : null;
 	return {
 		...data,
 		showWatched,
+		sort,
 		hidden: isChannelHidden(locals.user.id, params.id),
 		library: lib ? { id: lib.id, name: lib.name } : null
 	};

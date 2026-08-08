@@ -1,13 +1,16 @@
 /**
  * Read-only indexer.
  *
- * Walks each configured library under MEDIA_ROOT and upserts the result into SQLite. Two library
+ * Walks each configured library under MEDIA_ROOT and upserts the result into SQLite. Three library
  * formats, dispatched by `resolveLibraries()`:
  *   - channels: every `.info.json` with a sibling media file (ytdl-sub style) → channels of videos.
  *   - series:   every media file with a sibling Kodi/Emby `.nfo` (or a bare `SxxExx` filename), plus
  *               local poster/fanart/`-thumb.jpg` images (*arr style) → series of season/episode rows.
- * Series reuse the `channels`/`videos` tables: a series is a channel (`kind='series'`), an episode is
- * a video carrying `season_number`/`episode_number`.
+ *   - movies:   `Name (Year)/` folders with a `movie.nfo` + poster/fanart (Radarr/Kodi style) → ONE
+ *               synthetic channel (`kind='movies'`, named after the library) holding every movie.
+ * Series/movies reuse the `channels`/`videos` tables: a series is a channel (`kind='series'`), an
+ * episode is a video carrying `season_number`/`episode_number`; a movie is a video carrying `year` +
+ * `poster_path` (its `thumb_path` holds the FANART so movie cards stay 16:9 in the Recent feed).
  *
  * Incremental (unchanged sidecar mtime → skipped) and prunes rows whose files vanished. Nothing here
  * mutates the library. The walk is **async + batched**: it commits in small transactions and yields to
@@ -109,6 +112,8 @@ function buildVideoRow(
 		channel_id: channelId,
 		season_number: null,
 		episode_number: null,
+		year: null,
+		poster_path: null,
 		title: asStr(info.title) ?? asStr(info.fulltitle) ?? path.parse(media).name,
 		description: asStr(info.description),
 		upload_date: asStr(info.upload_date),
@@ -132,7 +137,7 @@ function buildVideoRow(
 }
 
 const VIDEO_COLUMNS = [
-	'id', 'channel_id', 'season_number', 'episode_number', 'title', 'description',
+	'id', 'channel_id', 'season_number', 'episode_number', 'year', 'poster_path', 'title', 'description',
 	'upload_date', 'timestamp', 'duration', 'view_count', 'like_count', 'width',
 	'height', 'fps', 'vcodec', 'acodec', 'tags', 'chapters', 'webpage_url',
 	'video_path', 'thumb_path', 'info_path', 'mtime'
@@ -222,10 +227,30 @@ interface EpisodeMeta {
 
 const intOf = (s: string | null): number | null => (s && /^-?\d+$/.test(s) ? parseInt(s, 10) : null);
 
-function parseEpisodeNfo(xml: string): EpisodeMeta {
+/** width/height/codecs/duration/fps from a Kodi `<streamdetails>` block — episode and movie NFOs
+ *  share the exact structure, so both parsers spread this. */
+function streamMeta(xml: string): {
+	width: number | null;
+	height: number | null;
+	vcodec: string | null;
+	acodec: string | null;
+	duration: number | null;
+	fps: number | null;
+} {
 	const video = xml.match(/<video>([\s\S]*?)<\/video>/i)?.[1] ?? '';
 	const audio = xml.match(/<audio>([\s\S]*?)<\/audio>/i)?.[1] ?? '';
 	const fpsRaw = xmlTag(video, 'framerate');
+	return {
+		width: intOf(xmlTag(video, 'width')),
+		height: intOf(xmlTag(video, 'height')),
+		vcodec: normCodec(xmlTag(video, 'codec'), V_CODEC),
+		acodec: normCodec(xmlTag(audio, 'codec'), A_CODEC),
+		duration: intOf(xmlTag(video, 'durationinseconds')),
+		fps: fpsRaw && Number.isFinite(+fpsRaw) ? Math.round(+fpsRaw * 1000) / 1000 : null
+	};
+}
+
+function parseEpisodeNfo(xml: string): EpisodeMeta {
 	return {
 		title: xmlTag(xml, 'title'),
 		season: intOf(xmlTag(xml, 'season')),
@@ -233,12 +258,7 @@ function parseEpisodeNfo(xml: string): EpisodeMeta {
 		aired: xmlTag(xml, 'aired'),
 		plot: xmlTag(xml, 'plot'),
 		tvdbId: xmlUniqueId(xml, 'tvdb'),
-		width: intOf(xmlTag(video, 'width')),
-		height: intOf(xmlTag(video, 'height')),
-		vcodec: normCodec(xmlTag(video, 'codec'), V_CODEC),
-		acodec: normCodec(xmlTag(audio, 'codec'), A_CODEC),
-		duration: intOf(xmlTag(video, 'durationinseconds')),
-		fps: fpsRaw && Number.isFinite(+fpsRaw) ? Math.round(+fpsRaw * 1000) / 1000 : null
+		...streamMeta(xml)
 	};
 }
 
@@ -257,9 +277,203 @@ function airedToTs(aired: string | null): number | null {
 	return m ? Math.trunc(Date.UTC(+m[1], +m[2] - 1, +m[3]) / 1000) : null;
 }
 
-/** Stable, URL-safe fallback id for an episode with no provider uniqueid — keyed off its path. */
+/** Stable, URL-safe fallback id for an episode/movie with no provider uniqueid — keyed off its path. */
 function pathId(relPath: string): string {
 	return 'ep-' + crypto.createHash('sha1').update(relPath).digest('hex').slice(0, 16);
+}
+
+// --- movies: Kodi/Radarr <movie> .nfo + `Name (Year)` folders --------------------------------------
+
+const MOVIE_NFO = 'movie.nfo';
+/** Trailers/samples living beside the main file are not the movie (Radarr writes `<base>-trailer`). */
+const NON_FEATURE = /(^|[-. ])(trailer|sample)$/i;
+
+/** Every `<name>…</name>` occurrence, entity-decoded — Kodi lists genres as repeated `<genre>` tags. */
+function xmlTags(xml: string, name: string): string[] {
+	const out: string[] = [];
+	const re = new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, 'gi');
+	for (const m of xml.matchAll(re)) {
+		const v = decodeXml(m[1].trim());
+		if (v) out.push(v);
+	}
+	return out;
+}
+
+interface MovieMeta {
+	title: string | null;
+	year: number | null;
+	premiered: string | null; // yyyy-mm-dd
+	plot: string | null;
+	genres: string[];
+	/** Top-billed cast (≤5, by <order>) + director(s) — relatedness signals, not display data. */
+	people: string[];
+	/** Kodi <set> collection name (franchise membership) — the strongest relatedness signal. */
+	setName: string | null;
+	runtimeMin: number | null; // <runtime> minutes — fallback when streamdetails has no duration
+	tmdbId: string | null;
+	imdbId: string | null;
+	width: number | null;
+	height: number | null;
+	vcodec: string | null;
+	acodec: string | null;
+	duration: number | null;
+	fps: number | null;
+}
+
+/** Top-billed cast: `<actor>` blocks sorted by `<order>` (document order when absent), first `cap`. */
+function movieActors(xml: string, cap = 5): string[] {
+	const blocks = [...xml.matchAll(/<actor(?:\s[^>]*)?>([\s\S]*?)<\/actor>/gi)].map((m) => m[1]);
+	const named = blocks
+		.map((b, i) => ({ name: xmlTag(b, 'name'), order: intOf(xmlTag(b, 'order')) ?? i }))
+		.filter((a): a is { name: string; order: number } => !!a.name);
+	named.sort((a, b) => a.order - b.order);
+	return named.slice(0, cap).map((a) => a.name);
+}
+
+function parseMovieNfo(xml: string): MovieMeta {
+	const premiered = xmlTag(xml, 'premiered');
+	// <set> is either a block with an inner <name> (modern Kodi/Radarr) or bare text (older writers).
+	const setBlock = xmlTag(xml, 'set');
+	const setName = setBlock ? (xmlTag(setBlock, 'name') ?? (setBlock.includes('<') ? null : setBlock)) : null;
+	return {
+		title: xmlTag(xml, 'title'),
+		year: intOf(xmlTag(xml, 'year')) ?? (premiered ? intOf(premiered.slice(0, 4)) : null),
+		premiered,
+		plot: xmlTag(xml, 'plot') ?? xmlTag(xml, 'outline'),
+		genres: xmlTags(xml, 'genre'),
+		people: [...new Set([...movieActors(xml), ...xmlTags(xml, 'director')])],
+		setName,
+		runtimeMin: intOf(xmlTag(xml, 'runtime')),
+		tmdbId: xmlUniqueId(xml, 'tmdb'),
+		imdbId: xmlUniqueId(xml, 'imdb'),
+		...streamMeta(xml)
+	};
+}
+
+// `Heat (1995)` — the Radarr/Kodi naming convention; the parenthesised year is the anchor.
+const NAME_YEAR = /^(.+?)[ .]\(((?:19|20)\d{2})\)/;
+function parseMovieFilename(base: string): { title: string | null; year: number | null } {
+	const m = base.match(NAME_YEAR);
+	if (!m) return { title: base.replace(QUALITY_TAG, '').trim() || null, year: null };
+	return { title: m[1].replace(/\./g, ' ').trim() || null, year: parseInt(m[2], 10) };
+}
+
+/**
+ * Movie art: generic `poster.*`/`fanart.*` in the movie's own folder, else Radarr's per-file
+ * `<base>-poster.*`/`<base>-fanart.*` variants. `genericOk=false` for loose files in the library
+ * ROOT, where a folder-level poster.jpg would otherwise wrongly attach to every loose movie.
+ */
+function movieArt(dir: string, base: string, genericOk: boolean): { poster: string | null; fanart: string | null } {
+	let poster = genericOk ? firstExisting(dir, POSTER_NAMES) : null;
+	let fanart = genericOk ? firstExisting(dir, FANART_NAMES) : null;
+	if (!poster || !fanart) {
+		let entries: string[] = [];
+		try {
+			entries = fs.readdirSync(dir);
+		} catch {
+			/* unreadable dir → no art */
+		}
+		const baseL = base.toLowerCase();
+		const find = (suffix: string): string | undefined =>
+			entries.find((n) => {
+				const ext = path.extname(n).toLowerCase();
+				if (!THUMB_EXTS.includes(ext)) return false;
+				const stem = n.slice(0, n.length - ext.length).toLowerCase();
+				return stem === baseL + suffix || (genericOk && stem.endsWith(suffix));
+			});
+		if (!poster) {
+			const p = find('-poster');
+			poster = p ? path.join(dir, p) : null;
+		}
+		if (!fanart) {
+			const f = find('-fanart');
+			fanart = f ? path.join(dir, f) : null;
+		}
+	}
+	return { poster, fanart };
+}
+
+/** The main feature in a movie folder: the LARGEST media file in its root (multi-file folders carry
+ *  editions/extras — size beats name heuristics), trailers/samples excluded, subfolders ignored. */
+function mainFeature(dir: string): string | null {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(dir);
+	} catch {
+		return null;
+	}
+	let best: string | null = null;
+	let bestSize = -1;
+	for (const n of entries) {
+		if (!MEDIA_EXTS.includes(path.extname(n).toLowerCase())) continue;
+		if (NON_FEATURE.test(path.parse(n).name)) continue;
+		const p = path.join(dir, n);
+		let size: number;
+		try {
+			size = fs.statSync(p).size;
+		} catch {
+			continue;
+		}
+		if (size > bestSize) {
+			bestSize = size;
+			best = p;
+		}
+	}
+	return best;
+}
+
+function buildMovieRow(
+	meta: MovieMeta | null,
+	fname: { title: string | null; year: number | null },
+	id: string,
+	channelId: string,
+	media: string,
+	mediaMtimeS: number,
+	art: { poster: string | null; fanart: string | null },
+	infoPath: string,
+	mtime: number
+): Row {
+	return {
+		id,
+		channel_id: channelId,
+		season_number: null,
+		episode_number: null,
+		year: meta?.year ?? fname.year,
+		poster_path: art.poster ? rel(art.poster) : null,
+		title: meta?.title ?? fname.title ?? path.parse(media).name,
+		description: meta?.plot ?? null,
+		upload_date: meta?.premiered ? meta.premiered.replace(/-/g, '') : null,
+		// Recent = "recently ADDED" for movies: the FILE's mtime, not the premiere — an old film ripped
+		// yesterday should surface in the feed. The premiere lives in `year`/`upload_date` for display.
+		timestamp: Math.trunc(mediaMtimeS),
+		duration: meta?.duration ?? (meta?.runtimeMin ? meta.runtimeMin * 60 : null),
+		view_count: null,
+		like_count: null,
+		width: meta?.width ?? null,
+		height: meta?.height ?? null,
+		fps: meta?.fps ?? null,
+		vcodec: meta?.vcodec ?? null,
+		acodec: meta?.acodec ?? null,
+		// Genres ride the tag system (genre browsing via /tag works everywhere for free). Cast/director
+		// (`person:`) and collection (`set:`) ride the SAME index as NAMESPACED entries — pure
+		// relatedness signals: the idf weighting in moviesRelated naturally ranks a shared collection
+		// (df≈3) above a shared actor (df≈10) above a broad genre (df≈100s), and getVideo strips the
+		// namespaced entries so tag chips only ever show genres.
+		tags: JSON.stringify([
+			...(meta?.genres ?? []),
+			...(meta?.people ?? []).map((p) => 'person:' + p),
+			...(meta?.setName ? ['set:' + meta.setName] : [])
+		]),
+		chapters: '[]',
+		webpage_url: null,
+		video_path: rel(media),
+		// The 16:9 card-art rule: fanart fills the thumb slot so movie cards look native in Recent's
+		// landscape grid; the 2:3 poster is its OWN column for poster-shaped surfaces (library grid,
+		// detail). Poster-only folders fall back to the poster rather than no art at all.
+		thumb_path: art.fanart ? rel(art.fanart) : art.poster ? rel(art.poster) : null,
+		info_path: rel(infoPath),
+		mtime
+	};
 }
 
 function buildEpisodeRow(
@@ -278,6 +492,8 @@ function buildEpisodeRow(
 		channel_id: seriesId,
 		season_number: meta?.season ?? fname.season,
 		episode_number: meta?.episode ?? fname.episode,
+		year: null,
+		poster_path: null,
 		title: meta?.title ?? fname.title ?? path.parse(media).name,
 		description: meta?.plot ?? null,
 		upload_date: aired ? aired.replace(/-/g, '') : null,
@@ -422,6 +638,7 @@ export async function scan(full = false): Promise<ScanStats> {
 	const libs = resolveLibraries();
 	for (const lib of libs) {
 		if (lib.format === 'series') await indexSeries(lib, ctx);
+		else if (lib.format === 'movies') await indexMovies(lib, ctx);
 		else await indexChannels(lib, ctx, childLibraryDirs(lib, libs));
 	}
 
@@ -682,6 +899,109 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 		}
 		await tick();
 	}
+}
+
+/**
+ * Movies library: ONE synthetic channel (`kind='movies'`, named after the library) holds every movie —
+ * a movies library IS the collection, so it gets a poster wall, not a channels page. Each immediate
+ * subdir is a movie folder (Radarr layout: main file + `movie.nfo`/`<base>.nfo` + poster/fanart);
+ * loose media files in the library root count too. Extras/ subfolders and `-trailer`/`-sample`
+ * files are deliberately skipped. Ids prefer tmdb/imdb uniqueids (stable across moves/renames; two
+ * copies of the same movie collide last-scanned-wins, same rule as tvdb episodes) else the path hash.
+ */
+async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
+	// Keyed on the library ROW id (stable across folder renames/moves — watch state survives them).
+	// The implicit default library is never movies-format, so lib.id is always a number here.
+	const chanId = 'movies:' + (lib.id ?? 'root');
+
+	// Same durable "new" check as the other formats — never the disposable index.
+	const isNew = !ctx.wasSeenBefore.get(chanId);
+	ctx.stubChannel.run({ id: chanId, kind: 'movies', lib: lib.id, poster: null, fanart: null });
+	ctx.markSeen.run(chanId, Date.now());
+	if (isNew) applyNewChannelDefault(chanId, lib.newPrivate);
+
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(lib.root, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	const movieDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+	const looseFiles = entries
+		.filter((e) => e.isFile() && MEDIA_EXTS.includes(path.extname(e.name).toLowerCase()))
+		.map((e) => e.name)
+		.sort();
+
+	let foundAny = false;
+	let batch: Row[] = [];
+
+	const one = async (dir: string, media: string, genericArtOk: boolean): Promise<void> => {
+		const base = path.parse(media).name;
+		const nfoPath = firstExisting(dir, [MOVIE_NFO, base + NFO_SUFFIX]);
+		const sidecar = nfoPath ?? media; // what we track for the incremental mtime skip
+		let mtime: number;
+		let mediaMtimeS: number;
+		try {
+			mtime = fs.statSync(sidecar).mtimeMs / 1000;
+			mediaMtimeS = fs.statSync(media).mtimeMs / 1000;
+		} catch {
+			return;
+		}
+		const relSidecar = rel(sidecar);
+		const cached = ctx.existing.get(relSidecar);
+		if (!ctx.full && cached && cached.mtime === mtime) {
+			ctx.seenVideos.add(cached.id);
+			foundAny = true;
+		} else {
+			let meta: MovieMeta | null = null;
+			if (nfoPath) {
+				try {
+					meta = parseMovieNfo(fs.readFileSync(nfoPath, 'utf-8'));
+				} catch {
+					meta = null;
+				}
+			}
+			const fname = parseMovieFilename(base);
+			const art = movieArt(dir, base, genericArtOk);
+			const id = meta?.tmdbId
+				? 'tmdb-' + meta.tmdbId
+				: meta?.imdbId
+					? 'imdb-' + meta.imdbId
+					: pathId(rel(media));
+			batch.push(buildMovieRow(meta, fname, id, chanId, media, mediaMtimeS, art, sidecar, mtime));
+			ctx.seenVideos.add(id);
+			ctx.counters.indexed++;
+			foundAny = true;
+		}
+		if (++ctx.counters.processed % BATCH === 0) {
+			if (batch.length) {
+				ctx.upsertBatch(batch);
+				batch = [];
+			}
+			await tick();
+		}
+	};
+
+	for (const dirName of movieDirs) {
+		const dir = path.join(lib.root, dirName);
+		const media = mainFeature(dir);
+		if (media) await one(dir, media, true);
+	}
+	for (const f of looseFiles) {
+		if (NON_FEATURE.test(path.parse(f).name)) continue;
+		// Library-ROOT files: only `<base>-poster` style art may attach (a folder-level poster.jpg
+		// here would wrongly claim every loose movie).
+		await one(lib.root, path.join(lib.root, f), false);
+	}
+
+	if (batch.length) ctx.upsertBatch(batch);
+	if (foundAny) {
+		ctx.seenChannels.add(chanId);
+		ctx.enrichChannel.run({
+			id: chanId, name: lib.name, kind: 'movies', lib: lib.id, yt: null, url: null, fc: null, poster: null, fanart: null
+		});
+	}
+	await tick();
 }
 
 // --- scan orchestration: a lock + last-run state for status + auto-rescan ------

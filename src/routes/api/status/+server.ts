@@ -18,6 +18,6 @@ export const GET: RequestHandler = ({ locals }) => {
 		transcoding: 0, // always 0 since the background whole-file transcoder was removed; kept for client shape-compat
 		// Mirrors /api/v1/status — one negotiation surface, both API layers (see the v1 route).
 		serverVersion: SERVER_VERSION,
-		capabilities: ['libraries', 'series', 'sessions', 'prefs', 'shares', ...(hlsEnabled() ? ['hls'] : [])]
+		capabilities: ['libraries', 'series', 'movies', 'sessions', 'prefs', 'shares', ...(hlsEnabled() ? ['hls'] : [])]
 	});
 };
