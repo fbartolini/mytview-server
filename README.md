@@ -75,12 +75,14 @@ Baked into the image (override only if you must): `PORT=8700`, `HOST=0.0.0.0`,
 `MEDIA_ROOT=/media`, `DB_PATH=/data/index.db`, `TRANSCODE_DIR=/transcodes`.
 
 ### Hardware transcoding (amd64 + Intel iGPU)
-```yaml
-    environment:
-      TRANSCODE_HWACCEL: "1"
-    devices:
-      - /dev/dri:/dev/dri
+The repo ships [`docker-compose.hwaccel.yml`](docker-compose.hwaccel.yml) as a merge-in
+override, so the base compose stays runnable on hosts without a GPU:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.hwaccel.yml up -d
 ```
+
+(Equivalent by hand: `TRANSCODE_HWACCEL: "1"` plus `devices: [/dev/dri:/dev/dri]`.)
 
 ## Library layout
 
