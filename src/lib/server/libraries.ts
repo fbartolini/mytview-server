@@ -7,9 +7,14 @@
  * mount serves any number of libraries pointing at arbitrary subfolders — the media-server model,
  * not a per-volume/env convention.
  *
- * Zero-config default: with NO libraries defined, the whole MEDIA_ROOT is one public channels
- * library, so an existing single-library deploy keeps working untouched until the owner adds/splits
- * libraries. Every path stays relative to MEDIA_ROOT, so the traversal guard in files.ts is unchanged.
+ * EXPLICIT-ONLY (the zero-config implicit default was REMOVED 2026-08-09): with NO libraries defined,
+ * nothing is indexed — the first-run empty state walks the owner to /admin/libraries instead. The old
+ * implicit whole-MEDIA_ROOT-as-one-channels-library behavior confused mixed-content mounts (movies
+ * silently skipped while channels appeared) and its one-form-submit equivalent still exists: add a
+ * library with an empty folder ("(media root)") + channels format. A legacy deploy upgrading without
+ * config is caught by the scan's prune safety valve (populated index, zero seen → prune skipped), so
+ * its stale index stays browsable until the owner configures. Every path stays relative to
+ * MEDIA_ROOT, so the traversal guard in files.ts is unchanged.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -20,7 +25,7 @@ export type LibraryFormat = 'channels' | 'series' | 'movies';
 
 /** A resolved library the indexer walks. */
 export interface Library {
-	id: number | null; // null = the implicit default library (no DB row)
+	id: number; // the libraries-table row id (explicit-only — the implicit no-row default is gone)
 	name: string;
 	format: LibraryFormat;
 	root: string; // absolute directory the indexer walks
@@ -55,14 +60,11 @@ function rootFor(relPath: string): string | null {
 	return abs;
 }
 
-/** The active libraries (empty table → the implicit default). Called by the indexer each scan. */
+/** The active libraries (empty table → NOTHING is indexed; see the header). Called each scan. */
 export function resolveLibraries(): Library[] {
 	const rows = stateDb()
-		.prepare('SELECT id, name, path, format, new_private FROM libraries ORDER BY id')
+		.prepare('SELECT id, name, path, format, new_private FROM libraries ORDER BY COALESCE(sort_order, id), id')
 		.all() as LibraryRow[];
-	if (rows.length === 0) {
-		return [{ id: null, name: 'Library', format: 'channels', root: MEDIA_ROOT, prefix: '', newPrivate: false }];
-	}
 	const libs: Library[] = [];
 	for (const r of rows) {
 		const root = rootFor(r.path);
@@ -102,13 +104,32 @@ const toConfig = (r: LibraryRow): LibraryConfig => ({
 });
 
 export function listLibraries(): LibraryConfig[] {
+	// Owner-defined order (sort_order, managed at /admin/libraries) — the ONE ordering every surface
+	// inherits: web nav tabs, /api/v1/libraries (TV tab promotion, pickers), the admin list itself.
 	return (
 		stateDb()
 			.prepare(
-				'SELECT id, name, path, format, new_private, show_in_recent FROM libraries ORDER BY name COLLATE NOCASE'
+				'SELECT id, name, path, format, new_private, show_in_recent FROM libraries ORDER BY COALESCE(sort_order, id), id'
 			)
 			.all() as LibraryRow[]
 	).map(toConfig);
+}
+
+/** Move a library one step up/down in the owner-defined order. Renumbers the whole (tiny) list so
+ *  the sequence self-heals even if sort_order values ever collide. Out-of-range moves are no-ops. */
+export function moveLibrary(id: number, dir: 'up' | 'down'): void {
+	const d = stateDb();
+	d.transaction(() => {
+		const ids = (
+			d.prepare('SELECT id FROM libraries ORDER BY COALESCE(sort_order, id), id').all() as { id: number }[]
+		).map((r) => r.id);
+		const i = ids.indexOf(id);
+		const j = dir === 'up' ? i - 1 : i + 1;
+		if (i < 0 || j < 0 || j >= ids.length) return;
+		[ids[i], ids[j]] = [ids[j], ids[i]];
+		const set = d.prepare('UPDATE libraries SET sort_order = ? WHERE id = ?');
+		ids.forEach((lid, idx) => set.run(idx + 1, lid));
+	})();
 }
 
 /** Normalise a user-entered folder to a clean MEDIA_ROOT-relative path, or null if it escapes. */
@@ -141,7 +162,8 @@ export function addLibrary(
 ): void {
 	stateDb()
 		.prepare(
-			'INSERT INTO libraries (name, path, format, new_private, show_in_recent, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			'INSERT INTO libraries (name, path, format, new_private, show_in_recent, created_at, sort_order) ' +
+				'VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM libraries))'
 		)
 		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, showInRecent ? 1 : 0, now);
 }

@@ -1,10 +1,47 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
 	import { invalidateAll } from '$app/navigation';
+	import { onMount } from 'svelte';
 	import type { SubmitFunction } from '@sveltejs/kit';
 	import type { PageData, ActionData } from './$types';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
+
+	// Live indexing feedback right where the owner just clicked Add: the background scan's
+	// per-library progress (server-owned, same /api/status the header ring polls — 2s cadence
+	// while this page is open). When the scan we watched finishes, refresh the page data so the
+	// library rows + nav tabs reflect the newly indexed content.
+	type ScanBanner = { running: boolean; library: string | null; videos: number };
+	let scanBanner = $state<ScanBanner | null>(null);
+	onMount(() => {
+		let sawScan = false;
+		const poll = async () => {
+			try {
+				const r = await fetch('/api/status');
+				if (!r.ok) return;
+				const j = await r.json();
+				if (j.scanning) {
+					sawScan = true;
+					scanBanner = {
+						running: true,
+						library: j.progress?.library ?? null,
+						videos: j.progress?.videos ?? 0
+					};
+				} else if (sawScan) {
+					sawScan = false;
+					scanBanner = { running: false, library: null, videos: j.videos };
+					await invalidateAll();
+				} else if (scanBanner?.running) {
+					scanBanner = null; // scan vanished between polls — drop the stale spinner
+				}
+			} catch {
+				/* transient — try again next tick */
+			}
+		};
+		poll();
+		const iv = setInterval(poll, 2000);
+		return () => clearInterval(iv);
+	});
 
 	type Format = 'channels' | 'series' | 'movies';
 	type Lib = PageData['libraries'][number];
@@ -97,8 +134,9 @@
 			— <span class="text-base-content">channels</span> (videos + <code>.info.json</code>),
 			<span class="text-base-content">series</span> (TV shows with <code>.nfo</code> + seasons) or
 			<span class="text-base-content">movies</span> (film folders with <code>movie.nfo</code> + posters) —
-			and its own default visibility for newly-found items. With none defined, the whole media folder is
-			one public channels library.
+			and its own default visibility for newly-found items. Nothing is indexed until at least one
+			library exists — to index the whole media folder as one, add a channels library with the folder
+			left empty.
 		</p>
 	</div>
 	<form method="POST" action="?/scan" use:enhance>
@@ -112,7 +150,20 @@
 {#if errorMsg}
 	<p class="mb-3 rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-sm text-red-300">{errorMsg}</p>
 {/if}
-{#if scanStarted}
+{#if scanBanner}
+	<p class="mb-3 flex items-center gap-2 rounded border border-line bg-base-200 px-3 py-1.5 text-sm text-muted">
+		{#if scanBanner.running}
+			<span class="inline-block animate-spin text-primary">⟳</span>
+			{#if scanBanner.library}
+				<span>Indexing <span class="text-base-content">{scanBanner.library}</span> — {scanBanner.videos} videos so far…</span>
+			{:else}
+				<span>Re-indexing in the background…</span>
+			{/if}
+		{:else}
+			<span>Indexing finished — {scanBanner.videos} videos.</span>
+		{/if}
+	</p>
+{:else if scanStarted}
 	<p class="mb-3 text-sm text-muted">Re-indexing in the background — progress shows in the header.</p>
 {/if}
 
@@ -120,12 +171,35 @@
 <div class="mb-6 divide-y divide-line rounded border border-line">
 	{#if data.libraries.length === 0}
 		<p class="px-3 py-4 text-sm text-muted">
-			No libraries yet — the whole media folder is treated as one public channels library. Add one below
-			to split or reclassify it.
+			No libraries yet — nothing is indexed until you add one below.
 		</p>
 	{/if}
-	{#each data.libraries as l (l.id)}
+	{#each data.libraries as l, i (l.id)}
 		<div class="flex items-center gap-3 px-3 py-2.5">
+			<!-- Owner-defined order: these arrows set the order every surface shows the libraries in —
+			     web nav tabs, the TV apps' promoted tabs, and the library pickers. -->
+			<div class="flex flex-col">
+				<form method="POST" action="?/move" use:enhance>
+					<input type="hidden" name="id" value={l.id} />
+					<input type="hidden" name="dir" value="up" />
+					<button
+						aria-label="Move {l.name} up"
+						disabled={i === 0}
+						class="block px-1 text-xs leading-4 text-muted transition-colors hover:text-base-content disabled:pointer-events-none disabled:opacity-25"
+						>▲</button
+					>
+				</form>
+				<form method="POST" action="?/move" use:enhance>
+					<input type="hidden" name="id" value={l.id} />
+					<input type="hidden" name="dir" value="down" />
+					<button
+						aria-label="Move {l.name} down"
+						disabled={i === data.libraries.length - 1}
+						class="block px-1 text-xs leading-4 text-muted transition-colors hover:text-base-content disabled:pointer-events-none disabled:opacity-25"
+						>▼</button
+					>
+				</form>
+			</div>
 			<div class="min-w-0 flex-1">
 				<div class="flex items-center gap-2">
 					<span class="truncate font-medium text-base-content">{l.name}</span>

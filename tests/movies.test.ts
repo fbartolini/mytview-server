@@ -5,13 +5,15 @@
  * MEDIA_ROOT (⇔ scan-safety.test.ts structure).
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
-import { tempEnv, writeMovie, writeChannelVideo } from './helpers';
+import { utimesSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import { tempEnv, writeMovie, writeChannelVideo, writeShow } from './helpers';
 
 const env = tempEnv();
 const { scan } = await import('../src/lib/server/indexer');
 const { db } = await import('../src/lib/server/db');
 const { addLibrary, updateLibrary, listLibraries } = await import('../src/lib/server/libraries');
-const { getChannel, listVideos, relatedVideos, getVideo } = await import('../src/lib/server/queries');
+const { getChannel, listVideos, relatedVideos, getVideo, listChannels } = await import('../src/lib/server/queries');
 const { createUser } = await import('../src/lib/server/auth');
 
 const HEAT_NFO = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -51,9 +53,12 @@ beforeAll(async () => {
 		nfo: '<movie><title>Ronin</title><year>1998</year><genre>Crime</genre><actor><name>Robert De Niro</name><order>0</order></actor><uniqueid type="tmdb">8195</uniqueid></movie>'
 	});
 	// A CHANNEL video sharing the genre word as a tag — the movies rail must never surface it.
-	writeChannelVideo(env.mediaRoot, 'ChannelX', 'cv1', { tags: ['Crime'] });
+	writeChannelVideo(env.mediaRoot, 'ChannelX', 'cv1', { tags: ['Crime'] })
+	// A show with tvshow.nfo genres — they live on the CHANNEL for the shows-grid filter.
+	writeShow(env.mediaRoot, 'Shows', 'Heat The Series', ['Crime', 'Drama']);
 	addLibrary('Films', 'Movies', 'movies', false);
-	addLibrary('Chans', '', 'channels', false); // root channels library (Movies subfolder auto-excluded)
+	addLibrary('Shows', 'Shows', 'series', false);
+	addLibrary('Chans', '', 'channels', false); // root channels library (Movies/Shows subfolders auto-excluded)
 	chanId = 'movies:' + listLibraries().find((l) => l.path === 'Movies')!.id;
 	await scan();
 });
@@ -118,6 +123,27 @@ describe('movies library', () => {
 		expect(String(v!.thumb_path)).toContain('poster.jpg'); // no fanart → poster fallback
 	});
 
+	it('un-renamed scene names parse: bare-year split, dot separators, site prefixes', async () => {
+		writeMovie(env.mediaRoot, 'Movies', 'American.Reunion.2012.UNRATED.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR', { nfo: null });
+		writeMovie(env.mediaRoot, 'Movies', 'www.UIndex.org - Bad Words 2013', { nfo: null });
+		writeMovie(env.mediaRoot, 'Movies', 'Blade.Runner.2049.2017.2160p.WEB-DL', { nfo: null });
+		await scan();
+		const t = (title: string) =>
+			db().prepare('SELECT year FROM videos WHERE title = ?').get(title) as { year: number } | undefined;
+		expect(t('American Reunion')?.year).toBe(2012);
+		expect(t('Bad Words')?.year).toBe(2013);
+		expect(t('Blade Runner 2049')?.year).toBe(2017); // greedy: the LAST year token anchors
+		// Remove them again (prune on rescan) so the grid/sort assertions below see the original set.
+		for (const dir of [
+			'American.Reunion.2012.UNRATED.BluRay.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR',
+			'www.UIndex.org - Bad Words 2013',
+			'Blade.Runner.2049.2017.2160p.WEB-DL'
+		]) {
+			rmSync(path.join(env.mediaRoot, 'Movies', dir), { recursive: true });
+		}
+		await scan();
+	});
+
 	it('movies grid always lists everything and sorts title/year/added', () => {
 		const byTitle = getChannel(chanId, uid, false, 'title')!;
 		expect(byTitle.channel.kind).toBe('movies');
@@ -137,6 +163,32 @@ describe('movies library', () => {
 		// Shared-genre movie first; the genre-less one still fills the rail (year proximity).
 		expect(rel[0].id).toBe('tmdb-8195');
 		expect(rel.some((v) => v.title === 'Alien')).toBe(true);
+	});
+
+	it('genres surface for filtering: show channels carry tvshow.nfo genres; the movies channel aggregates; wall videos carry theirs', () => {
+		const chans = listChannels({ id: uid });
+		const show = chans.find((c) => c.name === 'Heat The Series')!;
+		expect(show.genres).toEqual(['Crime', 'Drama']);
+		const moviesChan = chans.find((c) => c.id === chanId)!;
+		expect(moviesChan.genres).toEqual(['Crime', 'Thriller']); // union of its films', namespaced excluded
+		// Per-movie genres in the wall response (client-side filtering) — person:/set: never leak.
+		const wall = getChannel(chanId, uid)!;
+		const heat = wall.videos.find((v) => v.id === 'tmdb-949')!;
+		expect(heat.genres).toEqual(['Crime', 'Thriller']);
+		// Episodes never inherit show genres (they'd flood /tag pages) — and channel videos have none.
+		expect(wall.channel.kind).toBe('movies');
+	});
+
+	it('"recently added" is DURABLE: touching a file cannot resurface it as new', async () => {
+		const ts = () =>
+			(db().prepare('SELECT timestamp FROM videos WHERE id = ?').get('tmdb-949') as { timestamp: number }).timestamp;
+		const before = ts();
+		// The reported bug: some tool touches the file → mtime jumps → the movie falsely tops "added".
+		const f = path.join(env.mediaRoot, 'Movies', 'Heat (1995)', 'Heat (1995).mkv');
+		const future = new Date(Date.now() + 60_000);
+		utimesSync(f, future, future);
+		await scan(true); // full rescan re-reads everything
+		expect(ts()).toBe(before); // frozen first-seen (state.videos_seen), not the live mtime
 	});
 
 	it('library feed opt-out: movies leave Recent but stay in search + tag browsing', () => {

@@ -17,7 +17,7 @@
 		{#if channel.poster_path}
 			<img
 				loading="lazy"
-				src="/poster/{encodeURIComponent(channel.id)}"
+				src="/poster/{encodeURIComponent(channel.id)}?w=320"
 				alt=""
 				class="h-full w-full object-cover transition-[transform,filter] duration-300 group-hover:scale-[1.02] group-hover:brightness-[1.06]"
 			/>

@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS channels (
     follower_count INTEGER,
     poster_path    TEXT,
     fanart_path    TEXT,
-    video_count    INTEGER NOT NULL DEFAULT 0
+    video_count    INTEGER NOT NULL DEFAULT 0,
+    genres         TEXT                               -- JSON array: series (tvshow.nfo) + the movies channel (aggregate); NULL for ytdl channels
 );
 
 CREATE TABLE IF NOT EXISTS videos (
@@ -89,6 +90,7 @@ export function db(): Database.Database {
 	ensureColumn(d, 'videos', 'episode_number', 'INTEGER');
 	ensureColumn(d, 'videos', 'year', 'INTEGER');
 	ensureColumn(d, 'videos', 'poster_path', 'TEXT');
+	ensureColumn(d, 'channels', 'genres', 'TEXT');
 	// The season index references the just-migrated columns, so it CANNOT live in SCHEMA (which runs
 	// before these ALTERs) — create it here, once the columns exist (fresh via CREATE TABLE, else ALTER).
 	d.exec('CREATE INDEX IF NOT EXISTS idx_videos_season ON videos(channel_id, season_number, episode_number)');

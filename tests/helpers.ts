@@ -26,6 +26,7 @@ export function tempEnv(): TestEnv {
 	process.env.MEDIA_ROOT = mediaRoot;
 	process.env.DB_PATH = path.join(dataDir, 'index.db');
 	process.env.HLS_DIR = 'off';
+	process.env.IMAGE_CACHE_DIR = 'off'; // default-on since 2026-08-09 — keep tests ffmpeg-free
 	process.env.SCAN_ON_START = '0';
 	return {
 		base,
@@ -49,6 +50,17 @@ export function writeChannelVideo(
 		JSON.stringify({ id, title: id, duration: 100, ...info })
 	);
 	writeFileSync(path.join(dir, `${id}.mp4`), '');
+}
+
+/** Write a minimal Sonarr-style show: `<lib>/<show>/tvshow.nfo` (title + genres) + one S01E01 file. */
+export function writeShow(mediaRoot: string, libPath: string, show: string, genres: string[] = []): void {
+	const season = path.join(mediaRoot, libPath, show, 'Season 1');
+	mkdirSync(season, { recursive: true });
+	writeFileSync(
+		path.join(mediaRoot, libPath, show, 'tvshow.nfo'),
+		'<tvshow><title>' + show + '</title>' + genres.map((g) => '<genre>' + g + '</genre>').join('') + '</tvshow>'
+	);
+	writeFileSync(path.join(season, `${show} - S01E01 - Pilot.mkv`), 'x');
 }
 
 /** Write a Radarr-style movie folder under a movies library: `<lib>/<folder>/<folder>.mkv` +

@@ -40,7 +40,7 @@
 		{#if video.poster_path && !imgError}
 			<img
 				loading="lazy"
-				src="/poster/{encodeURIComponent(video.id)}"
+				src="/poster/{encodeURIComponent(video.id)}?w=320"
 				alt=""
 				onerror={() => (imgError = true)}
 				class="h-full w-full object-cover transition-[transform,opacity,filter] duration-300 group-hover:scale-[1.03] group-hover:brightness-[1.06] {watched

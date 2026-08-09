@@ -11,6 +11,11 @@ import { tempEnv, writeChannelVideo } from './helpers';
 const env = tempEnv();
 const { scan } = await import('../src/lib/server/indexer');
 const { db } = await import('../src/lib/server/db');
+const { addLibrary } = await import('../src/lib/server/libraries');
+
+// Libraries are explicit-only (no implicit whole-root default) — the "(media root)" channels
+// library reproduces the old single-library shape this valve was designed around.
+addLibrary('Library', '', 'channels', false);
 
 afterAll(() => env.cleanup());
 

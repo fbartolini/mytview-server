@@ -47,7 +47,7 @@
 			<!-- Watched thumbs dim so unwatched pops when "show watched" is on (full again on hover). -->
 			<img
 				loading="lazy"
-				src="/thumb/{encodeURIComponent(video.id)}"
+				src="/thumb/{encodeURIComponent(video.id)}?w=480"
 				alt=""
 				onerror={() => (imgError = true)}
 				class="h-full w-full object-cover transition-[transform,opacity,filter] duration-300 group-hover:scale-[1.03] group-hover:brightness-[1.06] {watched

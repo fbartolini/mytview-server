@@ -132,9 +132,22 @@ via the device-code fallback below.
 body `{ autoplayNext?, stillWatchingAfter? }` → `{ prefs: { … } }`. Server-owned, so the change syncs to the user's other devices.
 
 ### `GET /api/v1/status`
-`{ scanning, everScanned, error, videos, channels, transcoding, serverVersion, capabilities }` — counts
-are **visibility-filtered**. Use `everScanned=false || scanning` to show an "indexing" state vs "empty";
-poll (~30s) to auto-refresh the feed when a background scan finishes. `transcoding` is legacy (always 0).
+`{ scanning, everScanned, error, progress, videos, channels, transcoding, serverVersion, capabilities }` —
+counts are **visibility-filtered**. Use `everScanned=false || scanning` to show an "indexing" state vs
+"empty"; poll (~30s) to auto-refresh the feed when a background scan finishes. `transcoding` is legacy
+(always 0).
+**`progress`** (added 0.4.1, additive — older servers omit it): live scan feedback, `null` unless a scan
+is running, else `{ library, videos, indexed }` — `library` = display name of the library currently being
+walked (`null` = end-of-scan cleanup), `videos` = items recognized so far this scan, `indexed` = of those,
+re-parsed. **`seq`** (added 0.4.1, additive): a counter that bumps on every completed scan that CHANGED
+the index — poll it and re-fetch cached lists/nav when it moves (a fast scan can start and finish between
+two polls, so watching the `scanning` flag alone misses completions). Rescan requests that collide with a
+running scan are QUEUED server-side (one latched follow-up), never dropped. Render it wherever an indexing state shows (e.g. "Indexing Movies — 214 videos so far…") so a
+first boot / just-added library reads as *working*, never as broken-empty. Two server behaviors back it:
+**never-indexed libraries are scanned first** (a just-added library's content appears within seconds, the
+full re-parse of established libraries queues behind it), and channel `video_count`s refresh **per batch**
+(nav tabs / `GET libraries` include the new library while its walk is still running — clients that fetch
+the libraries list once per launch will see it on their next fetch or via their status poll).
 **`capabilities`** (added 0.4.0) is the version-negotiation surface: an additive-only string list —
 currently `libraries | series | movies | sessions | prefs | shares` (+ `hls` when live transcode is
 enabled).
@@ -173,7 +186,8 @@ chapters: [{ start_time, end_time, title }], webpage_url`, and the server-owned:
 poster_path, fanart_path, video_count, unwatched, poster, fanart, isHidden }` (`poster`/`fanart` = signed;
 `isHidden` = this user unsubscribed). **`kind`** ∈ `channel | series | movies`. **`unwatched`** = per-user
 count of not-watched items → render as an unread-style **badge**. **`library_id`** = the owning library
-(null = the implicit default). Optional **`?library=<id>`** scopes the list to one library (mirrors the
+(null only on rows indexed by a pre-2026-08-09 server's implicit default — the next full rescan
+re-assigns or prunes them; libraries are explicit-only now). Optional **`?library=<id>`** scopes the list to one library (mirrors the
 web nav tabs).
 
 ### `GET /api/v1/channels/[id]?watched=&sort=`
@@ -205,6 +219,24 @@ library). The rules every client mirrors:
   Detail `tags[]` never contains the namespaced entries — clients only ever see genres.
 - **Navigation:** a movies library's nav tab goes STRAIGHT to its poster wall (the synthetic channel),
   not to a channels page listing one tile.
+- **INVARIANT — local filters only ever pair with COMPLETE responses.** The wall
+  (`channels/[id]`) and the channels/shows list are UNPAGINATED by design; that is what makes
+  client-side filter/sort correct. The paginated surfaces (Recent/search/`?tag=` on `/videos`)
+  never get local filters — genre filtering there is the server-side `?tag=` param. If a wall ever
+  needs pagination (huge libraries), its filter/sort MUST move to server params in the same change
+  (`?sort=` already exists; genre would become `?tag=` on `channels/[id]`).
+- **Sort + genre filter run CLIENT-side over the delivered list** (the wall arrives complete):
+  sorting uses the same three contract keys as `?sort=` — title (case-insensitive), year DESC,
+  added (`timestamp`) DESC — locally or via the param, identical result either way. For movies,
+  `timestamp` is the DURABLE first-indexed date (`state.videos_seen`, seeded from file mtime on first
+  sight then frozen) — a touched file, a quality upgrade, or an index rebuild never resurfaces an old
+  item as "recently added"; the genre filter
+  uses each movie's **`genres`** array (present on wall/`channels/[id]` items for movies — namespaced
+  relatedness entries never leak) with the chip options from `channel.genres` (the aggregate).
+- **Shows genre filter:** series channels carry **`genres`** (tvshow.nfo `<genre>`s) on Channel
+  objects — filter the shows GRID client-side; genres are deliberately NOT exploded onto episodes
+  (that would flood /tag pages with every episode of every drama). ytdl channel videos fold YouTube's
+  `categories` into their tags instead (browsable via /tag).
 - Everything else (watch state, resume, playback descriptor, HLS fail-open, visibility) is identical —
   a movie is a video row.
 
@@ -214,6 +246,9 @@ library). The rules every client mirrors:
 at all (regardless of watched state), is **omitted**. **Empty array** when none are configured or none are
 visible → show a single "Channels" tab. Not access control — the channels within each library are
 visibility-filtered by the reads above; this just hides an empty/all-private library from the nav.
+**Order is owner-defined** (↑↓ on /admin/libraries, `sort_order`; added 0.4.1 — previously name-sorted):
+clients MUST render tabs/pickers in **response order**, never re-sort. Web tabs, the TV promoted tabs,
+and every picker all read this same order.
 
 ### `GET /api/v1/related/[id]`
 `{ items: [VideoSummary] }` — up to 12 neighbours ranked by shared tags, unwatched, visibility-filtered.

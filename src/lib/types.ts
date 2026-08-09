@@ -18,6 +18,10 @@ export interface ChannelSummary {
 	/** Configured library this channel belongs to (null/undefined = the implicit default library). Only
 	 *  populated by getChannel (SELECT *); listChannels omits it, so it's optional. */
 	library_id?: number | null;
+	/** Genre list: a series' tvshow.nfo <genre>s, or the movies channel's aggregate of its films'
+	 *  genres. Drives the genre filter chips (client-side over the delivered list). Null/omitted for
+	 *  ytdl channels. */
+	genres?: string[] | null;
 }
 
 export interface VideoSummary {
@@ -38,6 +42,9 @@ export interface VideoSummary {
 	/** Movies only — the 2:3 poster (served by /poster/[videoId]); selected by getChannel so the
 	 *  movies grid can render the poster wall. NULL/omitted elsewhere. */
 	poster_path?: string | null;
+	/** Movies only, in getChannel responses — the film's visible genres, so the wall can filter
+	 *  client-side over the fully-delivered list (no refetch). Omitted elsewhere. */
+	genres?: string[];
 	watched?: boolean;
 	position?: number;
 	/** H.264 + AAC — plays on restrictive native TV players (AVPlayer/AVPlay) without

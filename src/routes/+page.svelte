@@ -40,7 +40,7 @@
 			<a href={toggleHref} class="text-primary hover:underline">show watched</a>
 		</div>
 	{:else}
-		<IndexingOrEmpty q={data.q} />
+		<IndexingOrEmpty q={data.q} isOwner={data.isOwner} />
 	{/if}
 {:else}
 	{#key `${data.q}:${data.showWatched}`}

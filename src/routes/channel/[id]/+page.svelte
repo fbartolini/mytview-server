@@ -15,14 +15,21 @@
 	const isMovies = $derived(c.kind === 'movies');
 	const base = $derived(`/channel/${encodeURIComponent(c.id)}`);
 	const toggleHref = $derived(data.showWatched ? base : `${base}?watched=1`);
+	// Movies wall genre filter — CLIENT-side over the fully-delivered list (each movie carries its
+	// `genres`); the chip options come from the channel's aggregate. No refetch, no query param.
+	let genre = $state<string | null>(null);
 	// "Show watched" is incremental: it ADDS watched videos to the unwatched ones (shows everything).
 	// The default view shows only unwatched, live-dropping a card the instant it's marked watched.
 	// Movies are the exception: the poster wall IS the collection — always everything, watched badges
-	// instead of absence (the server returns all; don't re-filter here).
+	// instead of absence (the server returns all; don't re-filter here — except the genre chips).
 	const shown = $derived(
-		data.showWatched || isMovies
-			? data.videos
-			: data.videos.filter((v) => !($watchUpdates[v.id]?.watched ?? v.watched ?? false))
+		isMovies
+			? genre
+				? data.videos.filter((v) => v.genres?.includes(genre!))
+				: data.videos
+			: data.showWatched
+				? data.videos
+				: data.videos.filter((v) => !($watchUpdates[v.id]?.watched ?? v.watched ?? false))
 	);
 	// "Everything watched" in the default (unwatched-only) view — keyed off `shown` so it's right for
 	// both channels (load returns only unwatched) and series (load returns ALL episodes → filtered here).
@@ -129,6 +136,25 @@
 		{data.showWatched ? '× hide watched' : 'show watched'}
 	</a>
 </div>
+{/if}
+
+{#if isMovies && (c.genres?.length ?? 0) > 0}
+	<div class="mb-4 flex flex-wrap gap-1.5">
+		<button
+			onclick={() => (genre = null)}
+			class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === null
+				? 'border-primary/60 text-primary'
+				: 'border-line text-muted hover:text-base-content'}">all</button
+		>
+		{#each c.genres ?? [] as g (g)}
+			<button
+				onclick={() => (genre = genre === g ? null : g)}
+				class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === g
+					? 'border-primary/60 text-primary'
+					: 'border-line text-muted hover:text-base-content'}">{g}</button
+			>
+		{/each}
+	</div>
 {/if}
 
 {#if allWatched}

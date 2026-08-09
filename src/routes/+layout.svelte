@@ -78,6 +78,8 @@
 	// Syncing indicator: reflects manual rescans AND server-side scans (startup / the
 	// 5-min auto-rescan) via a light status poll, so mobile gets a cue too.
 	let serverScanning = $state(false);
+	let serverProgress = $state<{ library: string | null; videos: number } | null>(null);
+	let lastScanSeq: number | null = null; // last seen scan-seq (plain var — drives no rendering)
 	const syncing = $derived(scanning || serverScanning);
 	async function pollStatus() {
 		if (!data.user) return; // logged out (e.g. on /login) → nothing to poll, and avoids a redirect loop
@@ -89,7 +91,17 @@
 				goto(`/login?next=${encodeURIComponent(location.pathname + location.search)}`);
 				return;
 			}
-			if (r.ok) serverScanning = (await r.json()).scanning;
+			if (r.ok) {
+				const j = await r.json();
+				serverScanning = j.scanning;
+				serverProgress = j.progress ?? null;
+				// A scan CHANGED the index since our last poll → re-run every load. Keyed on the seq
+				// counter, not on watching the `scanning` flag flip — a fast scan (interval rescan, a
+				// small library) completes BETWEEN polls and a flag-based check misses it, which is how
+				// a just-added library's nav tab used to stay invisible until a hard refresh.
+				if (lastScanSeq !== null && j.seq !== lastScanSeq) await invalidateAll();
+				lastScanSeq = j.seq ?? null;
+			}
 		} catch {
 			/* ignore */
 		}
@@ -228,7 +240,11 @@
 			aria-label="Account menu"
 			aria-haspopup="menu"
 			aria-expanded={menuOpen}
-			title={syncing ? 'Scanning library…' : undefined}
+			title={syncing
+				? serverProgress?.library
+					? `Indexing ${serverProgress.library} — ${serverProgress.videos} videos…`
+					: 'Scanning library…'
+				: undefined}
 			class="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full border bg-base-200 font-mono text-xs font-semibold text-base-content transition-colors hover:border-primary/60 {menuOpen
 				? 'border-primary/60'
 				: 'border-line'}"

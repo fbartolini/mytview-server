@@ -113,6 +113,16 @@ CREATE TABLE IF NOT EXISTS channels_seen (
     first_seen_at INTEGER NOT NULL
 );
 
+-- DURABLE "entered the library" timestamps (ms) — the Plex-style dateAdded. Written once per video
+-- id (INSERT OR IGNORE) when the indexer first sees it, seeded from the file's mtime as the best
+-- backfill estimate, then FROZEN: index rebuilds, file moves, quality upgrades (same tmdb id), and
+-- mtime-rewriting tools (a touched file, Radarr's Change File Date, rsync) can never churn it.
+-- Currently drives the movies "recently added" ordering (videos.timestamp for movie rows).
+CREATE TABLE IF NOT EXISTS videos_seen (
+    video_id      TEXT PRIMARY KEY,
+    first_seen_at INTEGER NOT NULL
+);
+
 -- Short-lived, single-use codes that hand a signed-in NATIVE client off to a WEB session (the
 -- owner-admin punch-out): the app mints a code over its bearer API, opens /link/web?code=…, and the
 -- in-app browser trades it for a session cookie. 60s TTL, deleted on redeem — see auth.ts.
@@ -146,9 +156,9 @@ CREATE TABLE IF NOT EXISTS password_resets (
 CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets(user_id);
 
 -- Owner-configured media libraries (managed at /admin/libraries). Each is a subfolder of MEDIA_ROOT
--- with a format (channels | series) and a default visibility for newly-seen items. Durable (survives
--- rescans). An EMPTY table means the implicit default: the whole MEDIA_ROOT is one public channels
--- library — so an existing single-library deploy needs zero config. path is UNIQUE (one per folder).
+-- with a format (channels | series | movies) and a default visibility for newly-seen items. Durable
+-- (survives rescans). An EMPTY table means NOTHING is indexed (explicit-only since 2026-08-09 — the
+-- old implicit whole-root default is gone; libraries.ts header). path is UNIQUE (one per folder).
 CREATE TABLE IF NOT EXISTS libraries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
@@ -156,6 +166,7 @@ CREATE TABLE IF NOT EXISTS libraries (
     format      TEXT NOT NULL,              -- 'channels' | 'series' | 'movies'
     new_private INTEGER NOT NULL DEFAULT 0, -- newly-seen channels/shows here default to private?
     show_in_recent INTEGER NOT NULL DEFAULT 1, -- 0 = this library's items stay OUT of the Recent feed (collections)
+    sort_order  INTEGER,                    -- owner-defined display order (nav tabs, pickers, TV tab promotion)
     created_at  INTEGER NOT NULL
 );
 `;
@@ -182,6 +193,11 @@ export function stateDb(): Database.Database {
 	// browse deliberately (movies archive) rather than a feed. Gates ONLY the feed (queries.listVideos);
 	// search/tags/library pages are untouched. Default 1 = current behavior.
 	addColumnIfMissing(d, 'libraries', 'show_in_recent', 'INTEGER NOT NULL DEFAULT 1');
+	// Owner-defined library display order (/admin/libraries ↑↓). Backfill pre-existing rows with their
+	// id (== the old resolveLibraries order) so a migrated deploy keeps its scan order; the previously
+	// name-sorted nav simply becomes explicit. Idempotent — only NULLs are touched.
+	addColumnIfMissing(d, 'libraries', 'sort_order', 'INTEGER');
+	d.exec('UPDATE libraries SET sort_order = id WHERE sort_order IS NULL');
 	_state = d;
 	return _state;
 }

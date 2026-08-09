@@ -30,15 +30,6 @@ export const MEDIA_ROOT = resolve(env.MEDIA_ROOT ?? '/mnt/media/videos');
 // Where the SQLite index lives. Safe to delete; rebuilt from disk on scan.
 export const DB_PATH = resolve(env.DB_PATH ?? 'index.db');
 
-// Optional on-demand downscaling of thumbnail/poster/fanart variants (WS-I) for the NATIVE clients,
-// which request a `?w=` size — the WEB serves originals (it sends no `?w=`). OFF BY DEFAULT: the sources
-// are already ≤1280px JPGs every client handles, and generating variants with ffmpeg on first request
-// added real first-load latency + CPU strain (worst while a transcode is running) for a benefit only felt
-// on constrained links. Set `IMAGE_CACHE_DIR=<path>` to opt in (a disposable cache dir; a scan-time
-// prebake would be the better shape if this comes back). Unset or `off` → every route serves the original.
-export const IMAGE_CACHE_DIR =
-	env.IMAGE_CACHE_DIR && env.IMAGE_CACHE_DIR !== 'off' ? resolve(env.IMAGE_CACHE_DIR) : null;
-
 // Writable scratch root on the BULK array, OUTSIDE MEDIA_ROOT (which stays read-only). The whole-file
 // "compat copy" transcoder that used to own this directory was REMOVED (2026-08-07 — live HLS is the one
 // transcode path now); the env is still honored, but ONLY as the parent of the HLS_DIR default below, so
@@ -48,6 +39,21 @@ const TRANSCODE_DIR = env.TRANSCODE_DIR ? resolve(env.TRANSCODE_DIR) : null;
 
 // Use VAAPI hardware encode for live HLS (needs /dev/dri passed into the container). Off = libx264 (CPU).
 export const TRANSCODE_HWACCEL = bool(env.TRANSCODE_HWACCEL, false);
+
+// WS-I image cache: downscaled thumbnail/poster/fanart variants (`?w=`), DEFAULT-ON since 2026-08-09.
+// It shipped opt-in-only after the first on-demand shape blocked every request on an unbounded ffmpeg
+// herd (a cold 60-card grid stampeded the box) — both halves of that are fixed: generation is BOUNDED
+// with originals served immediately on a saturated miss (imagecache.ts), and the indexer PREBAKES card
+// sizes after each scan (the shape the original note asked for). Defaults under TRANSCODE_DIR/imgcache
+// (the writable bulk volume) when set, else an OS temp dir; `off` → every route serves the original.
+export const IMAGE_CACHE_DIR =
+	env.IMAGE_CACHE_DIR === 'off'
+		? null
+		: env.IMAGE_CACHE_DIR
+			? resolve(env.IMAGE_CACHE_DIR)
+			: TRANSCODE_DIR
+				? join(TRANSCODE_DIR, 'imgcache')
+				: join(tmpdir(), 'mytview-imgcache');
 
 // --- On-the-fly HLS transcode (Phase 1 adaptive-streaming) --------------------------------------------
 // EPHEMERAL: segments live in a per-session temp dir only WHILE watching, GC'd on idle + shutdown — no

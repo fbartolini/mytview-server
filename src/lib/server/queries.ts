@@ -42,14 +42,27 @@ export function listChannels(
 			: sort === 'unwatched'
 				? 'unwatched DESC, name COLLATE NOCASE'
 				: 'name COLLATE NOCASE';
-	return db()
+	const rows = db()
 		.prepare(
-			`SELECT id, name, kind, library_id, yt_channel_id, url, follower_count, poster_path, fanart_path, video_count,
+			`SELECT id, name, kind, library_id, yt_channel_id, url, follower_count, poster_path, fanart_path, video_count, genres,
 			        ${unwatched} AS unwatched
 			 FROM channels WHERE ${visibilityClause(user, 'id')}${libClause} ORDER BY ${orderBy}`
 		)
-		.all() as ChannelSummary[];
+		.all() as (Omit<ChannelSummary, 'genres'> & { genres: string | null })[];
+	// genres is stored as a JSON array string (series tvshow.nfo / the movies channel's aggregate) —
+	// parse for clients so the shows grid + movies wall can filter client-side.
+	return rows.map((r) => ({ ...r, genres: parseGenres(r.genres) }));
 }
+
+const parseGenres = (raw: string | null): string[] | null => {
+	if (!raw) return null;
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		return Array.isArray(parsed) ? parsed.filter((g): g is string => typeof g === 'string') : null;
+	} catch {
+		return null;
+	}
+};
 
 /** Library ids this user can see actual media in — ≥1 channel/series visible to them AND holding videos
  *  (video_count > 0, i.e. total, so a fully-*watched* library still counts). Drives hiding an all-private
@@ -87,11 +100,12 @@ export function getChannel(
 	showWatched = false,
 	sort: MovieSort = 'title'
 ): ChannelDetail | null {
-	const channel = db().prepare('SELECT * FROM channels WHERE id = ?').get(id) as
-		| ChannelSummary
+	const raw = db().prepare('SELECT * FROM channels WHERE id = ?').get(id) as
+		| (Omit<ChannelSummary, 'genres'> & { genres: string | null })
 		| undefined;
-	if (!channel) return null;
+	if (!raw) return null;
 	if (!canSeeChannel({ id: userId }, id)) return null; // private + not granted → treat as absent
+	const channel: ChannelSummary = { ...raw, genres: parseGenres(raw.genres) };
 	// Movies sort user-chosen (title/year/added — the poster-wall knobs); channels/series keep the one
 	// shared order (episodes by season/episode, channel videos newest-first).
 	const orderBy =
@@ -102,9 +116,9 @@ export function getChannel(
 					? 'v.timestamp DESC NULLS LAST, v.title COLLATE NOCASE'
 					: 'v.title COLLATE NOCASE'
 			: 'v.season_number ASC NULLS LAST, v.episode_number ASC NULLS LAST, v.timestamp DESC NULLS LAST, v.upload_date DESC';
-	const videos = db()
+	const rows = db()
 		.prepare(
-			`SELECT v.id, v.title, v.channel_id, v.season_number, v.episode_number, v.year, v.poster_path, v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
+			`SELECT v.id, v.title, v.channel_id, v.season_number, v.episode_number, v.year, v.poster_path, v.tags, v.upload_date, v.timestamp, v.duration, v.view_count, v.thumb_path,
 			        COALESCE(w.watched, 0) AS watched, COALESCE(w.position, 0) AS position
 			 FROM videos v
 			 LEFT JOIN state.watch_state w ON w.video_id = v.id AND w.user_id = @uid
@@ -117,8 +131,26 @@ export function getChannel(
 			// Series AND movies always list everything (the collection view — watched shows a badge, not
 			// absence); the hide-watched feed behavior stays a channels-format thing.
 			showAll: channel.kind === 'series' || channel.kind === 'movies' || showWatched ? 1 : 0
-		}) as VideoRow[];
-	return { channel, videos: videos.map(toSummary) };
+		}) as (VideoRow & { tags: string | null })[];
+	const videos = rows.map((r) => {
+		const { tags, ...rest } = r;
+		const v = toSummary(rest as VideoRow);
+		// Movies only: per-film visible genres (namespaced person:/set: relatedness entries stripped),
+		// so the wall filters client-side over the fully-delivered list — no refetch, no query param.
+		if (channel.kind === 'movies') {
+			let parsed: unknown = [];
+			try {
+				parsed = JSON.parse(tags || '[]');
+			} catch {
+				/* [] */
+			}
+			v.genres = (Array.isArray(parsed) ? parsed : []).filter(
+				(t): t is string => typeof t === 'string' && !/^(person|set):/.test(t)
+			);
+		}
+		return v;
+	});
+	return { channel, videos };
 }
 
 /** The next episode to play in a series: the first not-fully-watched episode in season/episode order

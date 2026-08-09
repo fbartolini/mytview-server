@@ -16,6 +16,12 @@ export const GET: RequestHandler = ({ locals }) => {
 		scanning: s.scanning,
 		everScanned: s.everScanned,
 		error: s.error,
+		// Live scan progress ({library, videos, indexed} | null) — feedback while indexing runs, so
+		// first boot / a just-added library reads as "working on it", never as broken-empty.
+		progress: s.progress,
+		// Completed-scan counter (bumps only when a scan CHANGED the index): clients re-fetch their
+		// cached lists/nav when it moves — catches even scans faster than their poll interval.
+		seq: s.seq,
 		videos,
 		channels,
 		transcoding: 0, // always 0 since the background whole-file transcoder was removed; kept for client shape-compat

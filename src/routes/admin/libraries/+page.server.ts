@@ -5,6 +5,7 @@ import {
 	addLibrary,
 	updateLibrary,
 	deleteLibrary,
+	moveLibrary,
 	normalizeLibraryPath,
 	libraryFolderExists,
 	type LibraryFormat
@@ -70,6 +71,21 @@ export const actions: Actions = {
 		if (!Number.isInteger(id) || id <= 0) return fail(400, { error: 'Bad library id.' });
 		deleteLibrary(id); // removes the config; its channels/videos are pruned on the next scan
 		void runScan(true); // FULL re-index so the removed library's items are cleared + the rest re-settle
+		return { ok: true };
+	},
+
+	// Reorder: one step up/down in the owner-defined display order. Pure display state — every
+	// surface (web tabs, /api/v1/libraries → TV tab promotion, pickers) reads the same order, so
+	// no rescan is needed.
+	move: async ({ request, locals }) => {
+		if (!isOwner(locals.user)) throw error(403);
+		const data = await request.formData();
+		const id = Number(data.get('id'));
+		const dir = String(data.get('dir'));
+		if (!Number.isInteger(id) || id <= 0 || (dir !== 'up' && dir !== 'down')) {
+			return fail(400, { error: 'Bad move.' });
+		}
+		moveLibrary(id, dir);
 		return { ok: true };
 	},
 

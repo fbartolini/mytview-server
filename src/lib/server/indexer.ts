@@ -13,8 +13,12 @@
  * `poster_path` (its `thumb_path` holds the FANART so movie cards stay 16:9 in the Recent feed).
  *
  * Incremental (unchanged sidecar mtime → skipped) and prunes rows whose files vanished. Nothing here
- * mutates the library. The walk is **async + batched**: it commits in small transactions and yields to
- * the event loop between batches, so a scan never freezes the server.
+ * mutates the library. The walk is **async + batched**: ALL filesystem I/O goes through `fs.promises`
+ * (the libuv pool — a slow disk/NAS stat parks a worker thread, never the event loop), sqlite writes
+ * stay synchronous but are committed in small transactions with an explicit yield between batches, and
+ * the prune deletes in chunks — so a scan never freezes the server, no matter how big or slow the
+ * library is. Keep it that way: a single stray `*Sync` fs call in a hot loop reintroduces the
+ * UI-goes-sluggish-during-scan bug this layout exists to prevent.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,6 +29,8 @@ import { db } from './db';
 import { resolveLibraries, type Library } from './libraries';
 import { gcShares } from './share';
 import { applyNewChannelDefault } from './visibility';
+import { warmImage } from './imagecache';
+import { resolveInMediaRoot } from './files';
 
 const MEDIA_EXTS = ['.mp4', '.mkv', '.webm', '.m4v'];
 const THUMB_EXTS = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -36,19 +42,20 @@ const BATCH = 25; // files processed between event-loop yields
 
 const rel = (p: string): string => path.relative(MEDIA_ROOT, p);
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+const fsp = fs.promises;
 
-function isFile(p: string): boolean {
+async function isFile(p: string): Promise<boolean> {
 	try {
-		return fs.statSync(p).isFile();
+		return (await fsp.stat(p)).isFile();
 	} catch {
 		return false;
 	}
 }
 
-function firstExisting(dir: string, names: string[]): string | null {
+async function firstExisting(dir: string, names: string[]): Promise<string | null> {
 	for (const name of names) {
 		const candidate = path.join(dir, name);
-		if (isFile(candidate)) return candidate;
+		if (await isFile(candidate)) return candidate;
 	}
 	return null;
 }
@@ -59,10 +66,10 @@ function firstExisting(dir: string, names: string[]): string | null {
  * `<base>.<img>`, `<mediafile>.<img>` (Title.mp4.jpg), `<base>…​.<img>` (Title-thumb.jpg),
  * else the lone image in the dir.
  */
-function findThumb(parent: string, base: string, mediaName: string): string | null {
+async function findThumb(parent: string, base: string, mediaName: string): Promise<string | null> {
 	let entries: string[];
 	try {
-		entries = fs.readdirSync(parent);
+		entries = await fsp.readdir(parent);
 	} catch {
 		return null;
 	}
@@ -126,7 +133,15 @@ function buildVideoRow(
 		fps: typeof info.fps === 'number' && Number.isFinite(info.fps) ? info.fps : null,
 		vcodec: asStr(info.vcodec),
 		acodec: asStr(info.acodec),
-		tags: JSON.stringify(Array.isArray(info.tags) ? info.tags : []),
+		// Uploader tags + YouTube's own `categories` (a fixed ~15-value taxonomy, e.g. "Science &
+		// Technology") — folding categories in gives channel videos a genre-ish axis through the
+		// existing /tag browsing for free. Deduped; both are plain user-visible tags.
+		tags: JSON.stringify([
+			...new Set([
+				...(Array.isArray(info.tags) ? info.tags : []),
+				...(Array.isArray(info.categories) ? info.categories : [])
+			])
+		]),
 		chapters: JSON.stringify(Array.isArray(info.chapters) ? info.chapters : []),
 		webpage_url: asStr(info.webpage_url),
 		video_path: rel(media),
@@ -144,10 +159,10 @@ const VIDEO_COLUMNS = [
 ];
 
 /** Recursively yield every *.info.json path under a dir, dirs & files sorted. */
-function* walkInfo(dir: string): Generator<string> {
+async function* walkInfo(dir: string): AsyncGenerator<string> {
 	let entries: fs.Dirent[];
 	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
+		entries = await fsp.readdir(dir, { withFileTypes: true });
 	} catch {
 		return;
 	}
@@ -158,10 +173,10 @@ function* walkInfo(dir: string): Generator<string> {
 }
 
 /** Recursively yield every media file under a dir (series episodes), dirs & files sorted. */
-function* walkMedia(dir: string): Generator<string> {
+async function* walkMedia(dir: string): AsyncGenerator<string> {
 	let entries: fs.Dirent[];
 	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
+		entries = await fsp.readdir(dir, { withFileTypes: true });
 	} catch {
 		return;
 	}
@@ -264,7 +279,10 @@ function parseEpisodeNfo(xml: string): EpisodeMeta {
 
 // Fallback when a media file has no sibling .nfo: pull SxxExx + a title from the filename.
 const SXXEXX = /\bS(\d{1,4})E(\d{1,4})\b/i;
-const QUALITY_TAG = /\s+(?:WEB[-.]?DL|WEB[-.]?Rip|Blu[-.]?Ray|BDRip|BRRip|HDTV|DVDRip|REMUX|1080p|720p|2160p|480p)[-.\s].*$/i;
+// Separator-tolerant ([-. ] not just space: scene names are dot-separated) and end-anchored-or-more,
+// so `Some.Movie.1080p` and `Title WEBDL-1080p …` both strip from the first quality token on.
+const QUALITY_TAG =
+	/[\s.-]+(?:WEB[-.]?DL|WEB[-.]?Rip|Blu[-.]?Ray|BDRip|BRRip|HDTV|DVDRip|REMUX|1080p|720p|2160p|480p)(?:[-.\s].*)?$/i;
 function parseEpisodeFilename(base: string): { season: number | null; episode: number | null; title: string | null } {
 	const m = base.match(SXXEXX);
 	if (!m || m.index == null) return { season: null, episode: null, title: null };
@@ -352,10 +370,22 @@ function parseMovieNfo(xml: string): MovieMeta {
 
 // `Heat (1995)` — the Radarr/Kodi naming convention; the parenthesised year is the anchor.
 const NAME_YEAR = /^(.+?)[ .]\(((?:19|20)\d{2})\)/;
+// Un-renamed scene releases: dot/underscore-separated with a BARE year token
+// (`American.Reunion.2012.UNRATED.BluRay.1080p.DTS-HD…`). GREEDY title so the LAST year-like token
+// anchors (`Blade.Runner.2049.2017` → year 2017), and everything after it (edition/quality/group)
+// drops. Known tradeoff (same as Plex/Jellyfin): a yearless title ENDING in a year-like number
+// (`Wonder Woman 1984`) mis-splits — an NFO or `Name (Year)` naming always wins over this fallback.
+const SCENE_YEAR = /^(.+)[. _-]((?:19|20)\d{2})(?=[. _-]|$)/;
+// Leading release-site prefix (`www.Site.org - Title 2013`) — pure junk before the real name.
+const SITE_PREFIX = /^www\.\S+\s*-\s*/i;
+/** Dots/underscores → spaces, collapse runs, drop trailing separators. */
+const cleanTitle = (s: string): string =>
+	s.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').replace(/[\s-]+$/, '').trim();
 function parseMovieFilename(base: string): { title: string | null; year: number | null } {
-	const m = base.match(NAME_YEAR);
-	if (!m) return { title: base.replace(QUALITY_TAG, '').trim() || null, year: null };
-	return { title: m[1].replace(/\./g, ' ').trim() || null, year: parseInt(m[2], 10) };
+	const stripped = base.replace(SITE_PREFIX, '');
+	const m = stripped.match(NAME_YEAR) ?? stripped.match(SCENE_YEAR);
+	if (!m) return { title: cleanTitle(stripped.replace(QUALITY_TAG, '')) || null, year: null };
+	return { title: cleanTitle(m[1]) || null, year: parseInt(m[2], 10) };
 }
 
 /**
@@ -363,13 +393,17 @@ function parseMovieFilename(base: string): { title: string | null; year: number 
  * `<base>-poster.*`/`<base>-fanart.*` variants. `genericOk=false` for loose files in the library
  * ROOT, where a folder-level poster.jpg would otherwise wrongly attach to every loose movie.
  */
-function movieArt(dir: string, base: string, genericOk: boolean): { poster: string | null; fanart: string | null } {
-	let poster = genericOk ? firstExisting(dir, POSTER_NAMES) : null;
-	let fanart = genericOk ? firstExisting(dir, FANART_NAMES) : null;
+async function movieArt(
+	dir: string,
+	base: string,
+	genericOk: boolean
+): Promise<{ poster: string | null; fanart: string | null }> {
+	let poster = genericOk ? await firstExisting(dir, POSTER_NAMES) : null;
+	let fanart = genericOk ? await firstExisting(dir, FANART_NAMES) : null;
 	if (!poster || !fanart) {
 		let entries: string[] = [];
 		try {
-			entries = fs.readdirSync(dir);
+			entries = await fsp.readdir(dir);
 		} catch {
 			/* unreadable dir → no art */
 		}
@@ -395,10 +429,10 @@ function movieArt(dir: string, base: string, genericOk: boolean): { poster: stri
 
 /** The main feature in a movie folder: the LARGEST media file in its root (multi-file folders carry
  *  editions/extras — size beats name heuristics), trailers/samples excluded, subfolders ignored. */
-function mainFeature(dir: string): string | null {
+async function mainFeature(dir: string): Promise<string | null> {
 	let entries: string[];
 	try {
-		entries = fs.readdirSync(dir);
+		entries = await fsp.readdir(dir);
 	} catch {
 		return null;
 	}
@@ -410,7 +444,7 @@ function mainFeature(dir: string): string | null {
 		const p = path.join(dir, n);
 		let size: number;
 		try {
-			size = fs.statSync(p).size;
+			size = (await fsp.stat(p)).size;
 		} catch {
 			continue;
 		}
@@ -428,7 +462,7 @@ function buildMovieRow(
 	id: string,
 	channelId: string,
 	media: string,
-	mediaMtimeS: number,
+	addedSec: number,
 	art: { poster: string | null; fanart: string | null },
 	infoPath: string,
 	mtime: number
@@ -443,9 +477,10 @@ function buildMovieRow(
 		title: meta?.title ?? fname.title ?? path.parse(media).name,
 		description: meta?.plot ?? null,
 		upload_date: meta?.premiered ? meta.premiered.replace(/-/g, '') : null,
-		// Recent = "recently ADDED" for movies: the FILE's mtime, not the premiere — an old film ripped
-		// yesterday should surface in the feed. The premiere lives in `year`/`upload_date` for display.
-		timestamp: Math.trunc(mediaMtimeS),
+		// Recent = "recently ADDED" for movies — the DURABLE first-seen date (state.videos_seen; seeded
+		// from the file's mtime on first sight, frozen after), NOT the live mtime: a touched/re-encoded
+		// file must not resurface as new. The premiere lives in `year`/`upload_date` for display.
+		timestamp: Math.trunc(addedSec),
 		duration: meta?.duration ?? (meta?.runtimeMin ? meta.runtimeMin * 60 : null),
 		view_count: null,
 		like_count: null,
@@ -527,6 +562,16 @@ export interface ScanStats {
 	elapsed_s: number;
 }
 
+/** Live progress of the scan in flight — the server-owned feedback every client renders (contract:
+ *  /api/status + /api/v1/status ship it verbatim). `library` is the one currently walking; null =
+ *  the end-of-scan cleanup (prune) phase. `videos` counts everything recognized so far this scan
+ *  (cached + re-parsed), `indexed` only the re-parsed. */
+export interface ScanProgress {
+	library: string | null;
+	videos: number;
+	indexed: number;
+}
+
 /** Shared per-scan state threaded into the per-format indexers. */
 interface ScanCtx {
 	full: boolean;
@@ -538,7 +583,13 @@ interface ScanCtx {
 	enrichChannel: Database.Statement;
 	wasSeenBefore: Database.Statement; // durable state.channels_seen probe — "is this channel new?"
 	markSeen: Database.Statement; // record a channel id in state.channels_seen (INSERT OR IGNORE)
+	markVideoSeen: Database.Statement; // durable dateAdded: INSERT OR IGNORE into state.videos_seen (seed = file mtime)
+	getVideoSeen: Database.Statement; // read the frozen first_seen_at back (ms)
 	counters: { indexed: number; processed: number };
+	/** Called by the walkers at every batch boundary AND at each library's end: refreshes the
+	 *  library's channel `video_count`s (so nav tabs/visibility appear while the walk is still
+	 *  running — they're gated on video_count > 0) and publishes live ScanProgress. */
+	onBatch: (lib: Library) => void;
 }
 
 /**
@@ -556,7 +607,7 @@ export async function scan(full = false): Promise<ScanStats> {
 
 	let ok = false;
 	try {
-		ok = fs.statSync(MEDIA_ROOT).isDirectory();
+		ok = (await fsp.stat(MEDIA_ROOT)).isDirectory();
 	} catch {
 		ok = false;
 	}
@@ -583,14 +634,17 @@ export async function scan(full = false): Promise<ScanStats> {
 
 	// Stub: ensure the row exists + refresh kind/poster/fanart from disk, but DON'T touch the
 	// display name (so an incremental scan of an all-cached channel keeps its real name).
+	// `genres` is COALESCEd in both statements: series pass theirs (tvshow.nfo, known at stub time),
+	// the movies channel gets its aggregate at enrich time, ytdl channels always pass null — and a
+	// null never wipes a previously-stored list (e.g. an incremental scan that re-parsed nothing).
 	const stubChannel = database.prepare(
-		`INSERT INTO channels (id, name, kind, library_id, poster_path, fanart_path) VALUES (@id, @id, @kind, @lib, @poster, @fanart)
-		 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, library_id=excluded.library_id, poster_path=excluded.poster_path, fanart_path=excluded.fanart_path`
+		`INSERT INTO channels (id, name, kind, library_id, poster_path, fanart_path, genres) VALUES (@id, @id, @kind, @lib, @poster, @fanart, @genres)
+		 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, library_id=excluded.library_id, poster_path=excluded.poster_path, fanart_path=excluded.fanart_path, genres=COALESCE(excluded.genres, channels.genres)`
 	);
 	// Enrich: run only when we parsed a video this scan (so we have a real name).
 	const enrichChannel = database.prepare(
-		`INSERT INTO channels (id, name, kind, library_id, yt_channel_id, url, follower_count, poster_path, fanart_path)
-		 VALUES (@id, @name, @kind, @lib, @yt, @url, @fc, @poster, @fanart)
+		`INSERT INTO channels (id, name, kind, library_id, yt_channel_id, url, follower_count, poster_path, fanart_path, genres)
+		 VALUES (@id, @name, @kind, @lib, @yt, @url, @fc, @poster, @fanart, @genres)
 		 ON CONFLICT(id) DO UPDATE SET
 		   name=excluded.name,
 		   kind=excluded.kind,
@@ -599,7 +653,8 @@ export async function scan(full = false): Promise<ScanStats> {
 		   url=COALESCE(excluded.url, channels.url),
 		   follower_count=COALESCE(excluded.follower_count, channels.follower_count),
 		   poster_path=excluded.poster_path,
-		   fanart_path=excluded.fanart_path`
+		   fanart_path=excluded.fanart_path,
+		   genres=COALESCE(excluded.genres, channels.genres)`
 	);
 
 	const existing = new Map<string, { id: string; mtime: number }>();
@@ -616,33 +671,73 @@ export async function scan(full = false): Promise<ScanStats> {
 	// make every channel "new" again and re-apply the library visibility default over choices the owner
 	// already made (a channel opened up on a private-default library would silently flip back private).
 	const wasSeenBefore = database.prepare('SELECT 1 FROM state.channels_seen WHERE channel_id = ?');
+	// Durable per-video "entered the library" (Plex-style dateAdded): written once, frozen forever —
+	// a touched file / upgrade / index rebuild can't resurface an old item as "recently added".
+	const markVideoSeen = database.prepare(
+		'INSERT OR IGNORE INTO state.videos_seen (video_id, first_seen_at) VALUES (?, ?)'
+	);
+	const getVideoSeen = database.prepare('SELECT first_seen_at AS t FROM state.videos_seen WHERE video_id = ?');
 	const markSeen = database.prepare(
 		'INSERT OR IGNORE INTO state.channels_seen (channel_id, first_seen_at) VALUES (?, ?)'
 	);
 
+	const seenVideos = new Set<string>();
+	const seenChannels = new Set<string>();
+	const counters = { indexed: 0, processed: 0 };
+	// `IS ?` (not `= ?`) so the implicit default library (library_id NULL) matches too.
+	const refreshCounts = database.prepare(
+		'UPDATE channels SET video_count = ' +
+			'(SELECT COUNT(*) FROM videos WHERE videos.channel_id = channels.id) WHERE library_id IS ?'
+	);
+	const onBatch = (lib: Library): void => {
+		refreshCounts.run(lib.id);
+		_progress = { library: lib.name, videos: seenVideos.size, indexed: counters.indexed };
+	};
+
 	const ctx: ScanCtx = {
 		full,
 		existing,
-		seenVideos: new Set<string>(),
-		seenChannels: new Set<string>(),
+		seenVideos,
+		seenChannels,
 		upsertBatch,
 		stubChannel,
 		enrichChannel,
 		wasSeenBefore,
 		markSeen,
-		counters: { indexed: 0, processed: 0 }
+		markVideoSeen,
+		getVideoSeen,
+		counters,
+		onBatch
 	};
 
 	await tick(); // return control to the server before any heavy per-file work
 
 	const libs = resolveLibraries();
-	for (const lib of libs) {
+	// Never-indexed libraries walk FIRST: right after an owner adds one, its content starts appearing
+	// within seconds — the (full) re-parse of the established libraries queues BEHIND it, not in front
+	// of it. Order is otherwise stable. First boot (nothing indexed) trivially keeps table order.
+	const hasRows = database.prepare(
+		'SELECT 1 FROM channels c WHERE c.library_id IS ? AND EXISTS ' +
+			'(SELECT 1 FROM videos v WHERE v.channel_id = c.id) LIMIT 1'
+	);
+	const isNewLib = (l: Library): boolean => !hasRows.get(l.id);
+	const ordered = [...libs.filter(isNewLib), ...libs.filter((l) => !isNewLib(l))];
+	console.log(
+		`[mytview] scan: started${full ? ' (full)' : ''} — ${libs.length} librar${libs.length === 1 ? 'y' : 'ies'}` +
+			(ordered.length ? ` [${ordered.map((l) => l.name).join(', ')}]` : ' (nothing to index)')
+	);
+	for (const lib of ordered) {
+		_progress = { library: lib.name, videos: seenVideos.size, indexed: counters.indexed };
+		const before = seenVideos.size;
 		if (lib.format === 'series') await indexSeries(lib, ctx);
 		else if (lib.format === 'movies') await indexMovies(lib, ctx);
 		else await indexChannels(lib, ctx, childLibraryDirs(lib, libs));
+		ctx.onBatch(lib); // final count refresh for libraries smaller than one batch
+		console.log(`[mytview] scan: ${lib.name} (${lib.format}) — ${seenVideos.size - before} items`);
 	}
 
-	const { seenVideos, seenChannels } = ctx;
+	// Cleanup phase (prune + counts): no current library.
+	_progress = { library: null, videos: seenVideos.size, indexed: counters.indexed };
 
 	// SAFETY VALVE: a scan that previously indexed videos but now sees NONE is far more likely a dead
 	// mount than a deliberately emptied library — the MEDIA_ROOT stat above passes for an EMPTY mount
@@ -665,28 +760,36 @@ export async function scan(full = false): Promise<ScanStats> {
 		};
 	}
 
-	const prune = database.transaction((): number => {
-		let pruned = 0;
-		const delVideo = database.prepare('DELETE FROM videos WHERE id = ?');
-		for (const r of database.prepare('SELECT id FROM videos').all() as { id: string }[]) {
-			if (!seenVideos.has(r.id)) {
-				delVideo.run(r.id);
-				pruned++;
-			}
-		}
-		const delChannel = database.prepare('DELETE FROM channels WHERE id = ?');
-		for (const r of database.prepare('SELECT id FROM channels').all() as { id: string }[]) {
-			if (!seenChannels.has(r.id)) delChannel.run(r.id);
-		}
-		database
-			.prepare(
-				'UPDATE channels SET video_count = ' +
-					'(SELECT COUNT(*) FROM videos WHERE videos.channel_id = channels.id)'
-			)
-			.run();
-		return pruned;
-	});
-	const pruned = prune();
+	// Prune in CHUNKS, yielding between them: one all-encompassing transaction held the write lock (and
+	// the event loop) for the whole sweep, which on a large deletion (library moved/reorganised) froze
+	// every request mid-scan. Chunked deletes mean a reader can briefly see a half-pruned index — the
+	// same progressive visibility the batched upserts above already have.
+	const PRUNE_CHUNK = 200;
+	const deadVideos = (database.prepare('SELECT id FROM videos').all() as { id: string }[])
+		.map((r) => r.id)
+		.filter((id) => !seenVideos.has(id));
+	const deadChannels = (database.prepare('SELECT id FROM channels').all() as { id: string }[])
+		.map((r) => r.id)
+		.filter((id) => !seenChannels.has(id));
+	const delVideo = database.prepare('DELETE FROM videos WHERE id = ?');
+	const delChannel = database.prepare('DELETE FROM channels WHERE id = ?');
+	const delVideoChunk = database.transaction((ids: string[]) => ids.forEach((id) => delVideo.run(id)));
+	const delChannelChunk = database.transaction((ids: string[]) => ids.forEach((id) => delChannel.run(id)));
+	for (let i = 0; i < deadVideos.length; i += PRUNE_CHUNK) {
+		delVideoChunk(deadVideos.slice(i, i + PRUNE_CHUNK));
+		await tick();
+	}
+	for (let i = 0; i < deadChannels.length; i += PRUNE_CHUNK) {
+		delChannelChunk(deadChannels.slice(i, i + PRUNE_CHUNK));
+		await tick();
+	}
+	database
+		.prepare(
+			'UPDATE channels SET video_count = ' +
+				'(SELECT COUNT(*) FROM videos WHERE videos.channel_id = channels.id)'
+		)
+		.run();
+	const pruned = deadVideos.length;
 	gcShares(); // drop expired share links
 
 	return {
@@ -718,16 +821,15 @@ function childLibraryDirs(lib: Library, all: Library[]): Set<string> {
  * (e.g. a series folder under a channels-at-root library), so it isn't mistaken for a channel.
  */
 async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>): Promise<void> {
-	const topDirs = fs
-		.readdirSync(lib.root, { withFileTypes: true })
+	const topDirs = (await fsp.readdir(lib.root, { withFileTypes: true }))
 		.filter((e) => e.isDirectory() && !excluded.has(e.name))
 		.map((e) => e.name)
 		.sort();
 
 	for (const cid of topDirs) {
 		const channelDir = path.join(lib.root, cid);
-		const poster = firstExisting(channelDir, POSTER_NAMES);
-		const fanart = firstExisting(channelDir, FANART_NAMES);
+		const poster = await firstExisting(channelDir, POSTER_NAMES);
+		const fanart = await firstExisting(channelDir, FANART_NAMES);
 		const posterRel = poster ? rel(poster) : null;
 		const fanartRel = fanart ? rel(fanart) : null;
 		let name = cid;
@@ -742,14 +844,14 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
 		// DURABLE channels_seen record — not this disposable index — so existing channels keep their
 		// visibility even across an index.db rebuild. See visibility.ts / state.ts.
 		const isNewChannel = !ctx.wasSeenBefore.get(cid);
-		ctx.stubChannel.run({ id: cid, kind: 'channel', lib: lib.id, poster: posterRel, fanart: fanartRel });
+		ctx.stubChannel.run({ id: cid, kind: 'channel', lib: lib.id, poster: posterRel, fanart: fanartRel, genres: null });
 		ctx.markSeen.run(cid, Date.now());
 		if (isNewChannel) applyNewChannelDefault(cid, lib.newPrivate);
 
-		for (const infoPath of walkInfo(channelDir)) {
+		for await (const infoPath of walkInfo(channelDir)) {
 			let mtime: number;
 			try {
-				mtime = fs.statSync(infoPath).mtimeMs / 1000;
+				mtime = (await fsp.stat(infoPath)).mtimeMs / 1000;
 			} catch {
 				continue;
 			}
@@ -761,16 +863,16 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
 			} else {
 				const base = path.basename(infoPath).slice(0, -INFO_SUFFIX.length);
 				const parent = path.dirname(infoPath);
-				const media = firstExisting(parent, MEDIA_EXTS.map((e) => base + e));
+				const media = await firstExisting(parent, MEDIA_EXTS.map((e) => base + e));
 				if (media) {
 					let info: Record<string, unknown> | null = null;
 					try {
-						info = JSON.parse(fs.readFileSync(infoPath, 'utf-8'));
+						info = JSON.parse(await fsp.readFile(infoPath, 'utf-8'));
 					} catch {
 						info = null;
 					}
 					if (info) {
-						const thumb = findThumb(parent, base, path.basename(media));
+						const thumb = await findThumb(parent, base, path.basename(media));
 						const vidId = String(info.id ?? base);
 						batch.push(buildVideoRow(info, vidId, cid, media, thumb, infoPath, mtime));
 						ctx.seenVideos.add(vidId);
@@ -791,6 +893,7 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
 					ctx.upsertBatch(batch);
 					batch = [];
 				}
+				ctx.onBatch(lib);
 				await tick();
 			}
 		}
@@ -799,7 +902,7 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
 			ctx.seenChannels.add(cid);
 			if (enriched) {
 				ctx.enrichChannel.run({
-					id: cid, name, kind: 'channel', lib: lib.id, yt: ytId, url, fc: followers, poster: posterRel, fanart: fanartRel
+					id: cid, name, kind: 'channel', lib: lib.id, yt: ytId, url, fc: followers, poster: posterRel, fanart: fanartRel, genres: null
 				});
 			}
 		}
@@ -813,8 +916,7 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
  * or the `SxxExx` filename (fallback); season/episode posters + `-thumb.jpg` come from local images.
  */
 async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
-	const showDirs = fs
-		.readdirSync(lib.root, { withFileTypes: true })
+	const showDirs = (await fsp.readdir(lib.root, { withFileTypes: true }))
 		.filter((e) => e.isDirectory())
 		.map((e) => e.name)
 		.sort();
@@ -822,17 +924,23 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 	for (const showName of showDirs) {
 		const showDir = path.join(lib.root, showName);
 		const seriesId = 'series:' + showName; // namespaced so it can't collide with a channel id
-		const poster = firstExisting(showDir, POSTER_NAMES);
-		const fanart = firstExisting(showDir, FANART_NAMES);
+		const poster = await firstExisting(showDir, POSTER_NAMES);
+		const fanart = await firstExisting(showDir, FANART_NAMES);
 		const posterRel = poster ? rel(poster) : null;
 		const fanartRel = fanart ? rel(fanart) : null;
 
-		// tvshow.nfo (optional) gives the display name; else fall back to the folder name.
+		// tvshow.nfo (optional) gives the display name + the show's <genre> list; else the folder name.
 		let name = showName;
+		let showGenres: string | null = null;
 		const showNfo = path.join(showDir, 'tvshow.nfo');
-		if (isFile(showNfo)) {
+		if (await isFile(showNfo)) {
 			try {
-				name = xmlTag(fs.readFileSync(showNfo, 'utf-8'), 'title') ?? showName;
+				const xml = await fsp.readFile(showNfo, 'utf-8');
+				name = xmlTag(xml, 'title') ?? showName;
+				// Genres live on the CHANNEL (the show) for the shows-grid filter — never exploded onto
+				// episodes, which would flood /tag pages with every episode of every drama.
+				const g = xmlTags(xml, 'genre');
+				showGenres = g.length ? JSON.stringify(g) : null;
 			} catch {
 				/* keep folder name */
 			}
@@ -840,23 +948,23 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 
 		// Same durable "new" check as indexChannels — never the disposable index.
 		const isNew = !ctx.wasSeenBefore.get(seriesId);
-		ctx.stubChannel.run({ id: seriesId, kind: 'series', lib: lib.id, poster: posterRel, fanart: fanartRel });
+		ctx.stubChannel.run({ id: seriesId, kind: 'series', lib: lib.id, poster: posterRel, fanart: fanartRel, genres: showGenres });
 		ctx.markSeen.run(seriesId, Date.now());
 		if (isNew) applyNewChannelDefault(seriesId, lib.newPrivate);
 
 		let foundAny = false;
 		let batch: Row[] = [];
 
-		for (const media of walkMedia(showDir)) {
+		for await (const media of walkMedia(showDir)) {
 			const parent = path.dirname(media);
 			const base = path.parse(media).name;
 			const nfoPath = path.join(parent, base + NFO_SUFFIX);
-			const hasNfo = isFile(nfoPath);
+			const hasNfo = await isFile(nfoPath);
 			const sidecar = hasNfo ? nfoPath : media; // what we track for the incremental mtime skip
 
 			let mtime: number;
 			try {
-				mtime = fs.statSync(sidecar).mtimeMs / 1000;
+				mtime = (await fsp.stat(sidecar)).mtimeMs / 1000;
 			} catch {
 				continue;
 			}
@@ -869,13 +977,13 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 				let meta: EpisodeMeta | null = null;
 				if (hasNfo) {
 					try {
-						meta = parseEpisodeNfo(fs.readFileSync(nfoPath, 'utf-8'));
+						meta = parseEpisodeNfo(await fsp.readFile(nfoPath, 'utf-8'));
 					} catch {
 						meta = null;
 					}
 				}
 				const fname = parseEpisodeFilename(base);
-				const thumb = findThumb(parent, base, path.basename(media));
+				const thumb = await findThumb(parent, base, path.basename(media));
 				const id = meta?.tvdbId ? 'tvdb-' + meta.tvdbId : pathId(rel(media));
 				batch.push(buildEpisodeRow(meta, fname, id, seriesId, media, thumb, sidecar, mtime));
 				ctx.seenVideos.add(id);
@@ -887,6 +995,7 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 					ctx.upsertBatch(batch);
 					batch = [];
 				}
+				ctx.onBatch(lib);
 				await tick();
 			}
 		}
@@ -894,7 +1003,7 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 		if (foundAny) {
 			ctx.seenChannels.add(seriesId);
 			ctx.enrichChannel.run({
-				id: seriesId, name, kind: 'series', lib: lib.id, yt: null, url: null, fc: null, poster: posterRel, fanart: fanartRel
+				id: seriesId, name, kind: 'series', lib: lib.id, yt: null, url: null, fc: null, poster: posterRel, fanart: fanartRel, genres: showGenres
 			});
 		}
 		await tick();
@@ -911,18 +1020,17 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
  */
 async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 	// Keyed on the library ROW id (stable across folder renames/moves — watch state survives them).
-	// The implicit default library is never movies-format, so lib.id is always a number here.
-	const chanId = 'movies:' + (lib.id ?? 'root');
+	const chanId = 'movies:' + lib.id;
 
 	// Same durable "new" check as the other formats — never the disposable index.
 	const isNew = !ctx.wasSeenBefore.get(chanId);
-	ctx.stubChannel.run({ id: chanId, kind: 'movies', lib: lib.id, poster: null, fanart: null });
+	ctx.stubChannel.run({ id: chanId, kind: 'movies', lib: lib.id, poster: null, fanart: null, genres: null });
 	ctx.markSeen.run(chanId, Date.now());
 	if (isNew) applyNewChannelDefault(chanId, lib.newPrivate);
 
 	let entries: fs.Dirent[];
 	try {
-		entries = fs.readdirSync(lib.root, { withFileTypes: true });
+		entries = await fsp.readdir(lib.root, { withFileTypes: true });
 	} catch {
 		return;
 	}
@@ -937,13 +1045,13 @@ async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 
 	const one = async (dir: string, media: string, genericArtOk: boolean): Promise<void> => {
 		const base = path.parse(media).name;
-		const nfoPath = firstExisting(dir, [MOVIE_NFO, base + NFO_SUFFIX]);
+		const nfoPath = await firstExisting(dir, [MOVIE_NFO, base + NFO_SUFFIX]);
 		const sidecar = nfoPath ?? media; // what we track for the incremental mtime skip
 		let mtime: number;
 		let mediaMtimeS: number;
 		try {
-			mtime = fs.statSync(sidecar).mtimeMs / 1000;
-			mediaMtimeS = fs.statSync(media).mtimeMs / 1000;
+			mtime = (await fsp.stat(sidecar)).mtimeMs / 1000;
+			mediaMtimeS = (await fsp.stat(media)).mtimeMs / 1000;
 		} catch {
 			return;
 		}
@@ -956,19 +1064,23 @@ async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 			let meta: MovieMeta | null = null;
 			if (nfoPath) {
 				try {
-					meta = parseMovieNfo(fs.readFileSync(nfoPath, 'utf-8'));
+					meta = parseMovieNfo(await fsp.readFile(nfoPath, 'utf-8'));
 				} catch {
 					meta = null;
 				}
 			}
 			const fname = parseMovieFilename(base);
-			const art = movieArt(dir, base, genericArtOk);
+			const art = await movieArt(dir, base, genericArtOk);
 			const id = meta?.tmdbId
 				? 'tmdb-' + meta.tmdbId
 				: meta?.imdbId
 					? 'imdb-' + meta.imdbId
 					: pathId(rel(media));
-			batch.push(buildMovieRow(meta, fname, id, chanId, media, mediaMtimeS, art, sidecar, mtime));
+			// Durable dateAdded: record on first sight (seed = the media file's mtime — best backfill
+			// estimate), then always read the FROZEN value back for the feed/"added" ordering.
+			ctx.markVideoSeen.run(id, Math.trunc(mediaMtimeS * 1000));
+			const addedSec = ((ctx.getVideoSeen.get(id) as { t: number } | undefined)?.t ?? mediaMtimeS * 1000) / 1000;
+			batch.push(buildMovieRow(meta, fname, id, chanId, media, addedSec, art, sidecar, mtime));
 			ctx.seenVideos.add(id);
 			ctx.counters.indexed++;
 			foundAny = true;
@@ -978,13 +1090,14 @@ async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 				ctx.upsertBatch(batch);
 				batch = [];
 			}
+			ctx.onBatch(lib);
 			await tick();
 		}
 	};
 
 	for (const dirName of movieDirs) {
 		const dir = path.join(lib.root, dirName);
-		const media = mainFeature(dir);
+		const media = await mainFeature(dir);
 		if (media) await one(dir, media, true);
 	}
 	for (const f of looseFiles) {
@@ -997,8 +1110,20 @@ async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 	if (batch.length) ctx.upsertBatch(batch);
 	if (foundAny) {
 		ctx.seenChannels.add(chanId);
+		// The wall's genre chips: the DISTINCT union of its movies' visible genres, read back from the
+		// just-flushed index (authoritative even on incremental scans, where re-parsing touched only
+		// some files — a Set built while walking would overwrite the full list with a partial one).
+		// Namespaced person:/set: relatedness entries are excluded.
+		const genreRows = db()
+			.prepare(
+				`SELECT DISTINCT value AS g FROM videos v, json_each(v.tags)
+				 WHERE v.channel_id = ? AND value NOT LIKE 'person:%' AND value NOT LIKE 'set:%'
+				 ORDER BY value COLLATE NOCASE`
+			)
+			.all(chanId) as { g: string }[];
 		ctx.enrichChannel.run({
-			id: chanId, name: lib.name, kind: 'movies', lib: lib.id, yt: null, url: null, fc: null, poster: null, fanart: null
+			id: chanId, name: lib.name, kind: 'movies', lib: lib.id, yt: null, url: null, fc: null, poster: null, fanart: null,
+			genres: genreRows.length ? JSON.stringify(genreRows.map((r) => r.g)) : null
 		});
 	}
 	await tick();
@@ -1009,25 +1134,93 @@ async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 let _scanning = false;
 let _last: ScanStats | null = null;
 let _lastError: string | null = null;
+let _progress: ScanProgress | null = null;
+/** Latched rerun: a runScan that collides with a running scan queues EXACTLY ONE follow-up (full
+ *  flags OR-ed) instead of being silently dropped — otherwise adding several libraries in quick
+ *  succession indexed only the first (each add fires a background rescan; the rest hit the lock and
+ *  vanished, leaving the LAST-added library invisible until the interval rescan). */
+let _pendingFull: boolean | null = null;
+/** Monotonic count of completed scans that CHANGED something (indexed or pruned > 0) — clients
+ *  invalidate their cached loads when it moves, catching even scans too fast for their poll to see
+ *  in the `scanning` flag. */
+let _seq = 0;
 
 export interface ScanStatus {
 	scanning: boolean;
 	everScanned: boolean;
 	error: string | null;
+	/** Live progress while `scanning`, null otherwise — see ScanProgress. */
+	progress: ScanProgress | null;
+	/** Bumped by every completed scan that changed the index — see _seq. */
+	seq: number;
 	last: ScanStats | null;
 }
 
 export function scanStatus(): ScanStatus {
-	return { scanning: _scanning, everScanned: _last !== null, error: _lastError, last: _last };
+	return {
+		scanning: _scanning,
+		everScanned: _last !== null,
+		error: _lastError,
+		progress: _scanning ? _progress : null,
+		seq: _seq,
+		last: _last
+	};
 }
 
-/** Run a scan unless one is already in progress. Returns stats, or null if skipped/failed. */
+/** WS-I scan-time prebake: derive the card-size variants (thumb 480 / poster 320, the sizes the web
+ *  and phone grids request) for everything indexed, SEQUENTIALLY through the bounded resize pipeline
+ *  — so the warmer holds at most one slot and live requests always have capacity. Fire-and-forget
+ *  after a scan that parsed anything; hits are single stat()s, failures fall back to originals. */
+async function warmImageCache(): Promise<void> {
+	const videos = db()
+		.prepare('SELECT thumb_path, poster_path FROM videos')
+		.all() as { thumb_path: string | null; poster_path: string | null }[];
+	const channels = db()
+		.prepare('SELECT poster_path FROM channels')
+		.all() as { poster_path: string | null }[];
+	const jobs: [string | null, number][] = [
+		...videos.flatMap((v): [string | null, number][] => [[v.thumb_path, 480], [v.poster_path, 320]]),
+		...channels.map((c): [string | null, number] => [c.poster_path, 320])
+	];
+	const start = Date.now();
+	let ensured = 0;
+	for (const [rel, width] of jobs) {
+		if (!rel) continue;
+		try {
+			const { absPath, stat } = await resolveInMediaRoot(rel);
+			await warmImage(absPath, stat, width);
+			ensured++;
+		} catch {
+			/* source vanished/unreadable — the image routes fall back to the original (or 404) anyway */
+		}
+	}
+	if (ensured > 0) {
+		console.log(
+			`[mytview] prebake: image variants ensured for ${ensured} sources in ${Math.round((Date.now() - start) / 100) / 10}s`
+		);
+	}
+}
+
+/** Run a scan unless one is already in progress — in which case a single follow-up is QUEUED (see
+ *  _pendingFull) and null returns immediately. Returns stats, or null if queued/failed. */
 export async function runScan(full = false): Promise<ScanStats | null> {
-	if (_scanning) return null;
+	if (_scanning) {
+		_pendingFull = (_pendingFull ?? false) || full;
+		console.log('[mytview] scan: requested while one is running — queued a follow-up');
+		return null;
+	}
 	_scanning = true;
 	try {
 		_last = await scan(full);
 		_lastError = null;
+		if (_last.indexed > 0 || _last.pruned > 0) _seq++;
+		console.log(
+			`[mytview] scan: done — ${_last.videos} videos (${_last.indexed} parsed, ${_last.pruned} pruned)` +
+				`${_last.pruneSkipped ? ' [prune SKIPPED — safety valve]' : ''} in ${_last.elapsed_s}s`
+		);
+		// Prebake image variants only when the scan actually (re)parsed something — an idle interval
+		// rescan (indexed 0) skips even the stat sweep.
+		if (_last.indexed > 0) void warmImageCache();
 		return _last;
 	} catch (e) {
 		_lastError = (e as Error).message;
@@ -1035,5 +1228,12 @@ export async function runScan(full = false): Promise<ScanStats | null> {
 		return null;
 	} finally {
 		_scanning = false;
+		_progress = null;
+		if (_pendingFull != null) {
+			const f = _pendingFull;
+			_pendingFull = null;
+			console.log(`[mytview] scan: running the queued follow-up${f ? ' (full)' : ''}`);
+			void runScan(f);
+		}
 	}
 }

@@ -32,6 +32,44 @@ let ffmpegMissing = false;
 // Dedupe concurrent generation of the same output (two grid requests for the same thumb+size).
 const inflight = new Map<string, Promise<boolean>>();
 
+// BOUNDED generation — what makes default-on safe: at most GEN_CONCURRENCY resizes run at once, the
+// rest queue FIFO. A request that can't start immediately is told so (`immediate: false`) and serves
+// the ORIGINAL right away while its job warms the cache for the next hit. The first on-demand shape
+// blocked every request on an unbounded spawn herd (a cold 60-card grid = 60 concurrent ffmpegs),
+// which is why the cache used to ship opt-in-only.
+const GEN_CONCURRENCY = 4;
+let generating = 0;
+const genQueue: Array<() => void> = [];
+const pump = (): void => {
+	while (generating < GEN_CONCURRENCY && genQueue.length) genQueue.shift()!();
+};
+
+/** Dedupe + bound a generation job. `immediate` = a slot was free (or the job already existed) and
+ *  the caller may reasonably await `p`; false = saturated, the caller should serve the original. */
+function scheduleGenerate(
+	src: string,
+	out: string,
+	width: number
+): { p: Promise<boolean>; immediate: boolean } {
+	const existing = inflight.get(out);
+	if (existing) return { p: existing, immediate: true };
+	const run = async (): Promise<boolean> => {
+		generating++;
+		try {
+			return await generate(src, out, width);
+		} finally {
+			generating--;
+			pump();
+		}
+	};
+	const immediate = generating < GEN_CONCURRENCY;
+	const p = (
+		immediate ? run() : new Promise<boolean>((res) => genQueue.push(() => void run().then(res)))
+	).finally(() => inflight.delete(out));
+	inflight.set(out, p);
+	return { p, immediate };
+}
+
 function cachePath(srcAbs: string, mtimeMs: number, width: number): string {
 	// Key on source path + mtime + width: a replaced/re-indexed source naturally misses (new mtime),
 	// so stale variants are never served and don't need explicit invalidation.
@@ -56,17 +94,31 @@ export async function resizedImage(
 	} catch {
 		/* miss → generate below */
 	}
-	let p = inflight.get(out);
-	if (!p) {
-		p = generate(srcAbs, out, width).finally(() => inflight.delete(out));
-		inflight.set(out, p);
-	}
+	const { p, immediate } = scheduleGenerate(srcAbs, out, width);
+	// Saturated: never make this request wait in line — the caller streams the ORIGINAL now, and the
+	// queued job means the variant is there for the next request.
+	if (!immediate) return null;
 	if (!(await p)) return null;
 	try {
 		return { absPath: out, stat: await stat(out) };
 	} catch {
 		return null;
 	}
+}
+
+/** Scan-time prebake entry (the indexer's post-scan warmer): ensure the variant exists, WAITING for
+ *  its bounded turn — the warmer calls this sequentially, so it holds at most ONE of the slots and
+ *  live requests always find capacity. A cache hit is a single stat(). */
+export async function warmImage(srcAbs: string, srcStat: Stats, width: number): Promise<void> {
+	if (!IMAGE_CACHE_DIR || ffmpegMissing) return;
+	const out = cachePath(srcAbs, srcStat.mtimeMs, width);
+	try {
+		await stat(out);
+		return; // already cached
+	} catch {
+		/* miss → generate */
+	}
+	await scheduleGenerate(srcAbs, out, width).p;
 }
 
 async function generate(src: string, out: string, width: number): Promise<boolean> {

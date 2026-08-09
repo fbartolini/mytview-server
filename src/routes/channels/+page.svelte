@@ -1,5 +1,6 @@
 <script lang="ts">
 	import ChannelCard from '$lib/components/ChannelCard.svelte';
+	import IndexingOrEmpty from '$lib/components/IndexingOrEmpty.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import type { PageData } from './$types';
@@ -10,6 +11,16 @@
 	const heading = $derived(data.library ? data.library.name : 'Channels');
 	const noun = $derived(
 		data.library?.format === 'series' ? 'shows' : data.library?.format === 'movies' ? 'movies' : 'channels'
+	);
+
+	// Genre chips (shows): union of the channels' genres (series carry tvshow.nfo <genre>s). Filtering
+	// is CLIENT-side over the already-delivered list — no refetch (⇔ the movies wall's genre chips).
+	let genre = $state<string | null>(null);
+	const genres = $derived(
+		[...new Set(data.channels.flatMap((c) => c.genres ?? []))].sort((a, b) => a.localeCompare(b))
+	);
+	const shownChannels = $derived(
+		genre ? data.channels.filter((c) => c.genres?.includes(genre!)) : data.channels
 	);
 
 	// Re-sort in place, preserving ?library. 'name' is the default → drop the param to keep URLs clean.
@@ -40,18 +51,38 @@
 </div>
 
 {#if data.channels.length === 0}
-	<div
-		class="rounded-xl border border-dashed border-line p-10 text-center font-mono text-sm text-muted"
-	>
-		{#if data.library}
+	{#if data.library}
+		<div
+			class="rounded-xl border border-dashed border-line p-10 text-center font-mono text-sm text-muted"
+		>
 			No {noun} in <span class="capitalize text-base-content">{heading}</span> yet.
-		{:else}
-			No channels indexed. Check <code class="text-primary">MEDIA_ROOT</code> and hit Rescan.
-		{/if}
-	</div>
+		</div>
+	{:else}
+		<!-- Same live indexing/guidance card as Recent: spinner + progress during a scan, and the
+		     owner "add your first library" call-to-action when a finished scan found nothing. -->
+		<IndexingOrEmpty isOwner={data.isOwner} />
+	{/if}
 {:else}
+	{#if genres.length > 0}
+		<div class="mb-4 flex flex-wrap gap-1.5">
+			<button
+				onclick={() => (genre = null)}
+				class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === null
+					? 'border-primary/60 text-primary'
+					: 'border-line text-muted hover:text-base-content'}">all</button
+			>
+			{#each genres as g (g)}
+				<button
+					onclick={() => (genre = genre === g ? null : g)}
+					class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === g
+						? 'border-primary/60 text-primary'
+						: 'border-line text-muted hover:text-base-content'}">{g}</button
+				>
+			{/each}
+		</div>
+	{/if}
 	<div class="channel-grid">
-		{#each data.channels as c (c.id)}
+		{#each shownChannels as c (c.id)}
 			<ChannelCard channel={c} />
 		{/each}
 	</div>
