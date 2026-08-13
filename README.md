@@ -17,7 +17,7 @@ this server over its [documented API](docs/api.md).
 - 📺 **Channels, series, and movies** — creator-channel libraries (`.info.json` sidecars), TV-series libraries (`.nfo` + `S01E02` naming, season/episode ordering, next-episode tracking), and movie libraries (Radarr/Kodi layout, a 2:3 poster wall with genre filters and sort). Libraries are configured in the UI, not env vars; fully-watched shows tidy themselves out of the grids until something new arrives.
 - 🎞️ **Direct-play first, live HLS fallback** — every client tries the original file first; when it can't decode it, the server live-transcodes an ephemeral HLS stream that starts in seconds (VAAPI hardware encode when available, CPU fallback). Nothing is pre-transcoded or stored long-term.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
-- 🌐 **Federation** — pair two MytView servers and share chosen channels, shows, or whole libraries with another household. Their catalog merges into your own libraries (browse, search, and watch state stay on *your* server) while video streams flow **directly** from the sharing server to the viewer — plus per-peer concurrent-stream caps and consumption stats for the sharer.
+- 🌐 **Federation** — peer with **any number** of other MytView servers, sharing and consuming in both directions. Share different channels, shows, or whole libraries with each household; everything you consume merges into your own libraries (browse, search, and watch state stay on *your* server) while video streams flow **directly** from whichever server holds the file — plus per-peer concurrent-stream caps and consumption stats for the sharer.
 - 🔄 **Plex sync** — two-way watched-state and resume-point sync with a Plex server on the same library. Each user links their own Plex account (plex.tv PIN flow); years of existing Plex history import on the first sync, and an unwatch in either app propagates to the other.
 
 Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
@@ -112,11 +112,14 @@ the owner through adding one (any subfolder — or the root — per library).
 
 ## Federation (share with another household)
 
-Two MytView servers can peer: one owner mints a single-use invite, the other pastes it, and the
-sharer then picks channels/shows/libraries to share on the Sharing page (a whole-library share
-covers future content automatically). The consumer maps each shared library into one of their
-own — or a new virtual library — and it merges seamlessly: same feed, search, tags, and per-user
-watch state, all served by the consumer's server. **Media never relays**: playback streams
+A MytView server can peer with **as many other servers as you like**, sharing to some and
+consuming from others (or both with the same peer). Pairing is per-peer: one owner mints a
+single-use invite, the other pastes it. The sharer then picks channels/shows/libraries **per
+peer** on the Sharing page — each federated server appears as one more column next to your
+users, and a whole-library share covers future content automatically. The consumer maps each
+shared library into one of their own — or a new virtual library, and several peers' libraries
+can merge into the same one — with the same feed, search, tags, and per-user watch state, all
+served by the consumer's server. **Media never relays**: playback streams
 directly from the sharing server to the viewer's device via short-lived signed URLs, so a slow
 home uplink is never in the middle. Duplicate items (the same movie on both servers) collapse
 automatically — the local copy wins.
