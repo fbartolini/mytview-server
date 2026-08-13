@@ -1,9 +1,10 @@
 # MytView Server
 
 **A clean, fast, read-only viewer for a self-hosted video library** — video files plus their
-metadata sidecars (`.info.json`, or Kodi/Emby-style `.nfo` for TV series) — with multi-user
-accounts, per-user watch state, owner-controlled per-channel privacy, public share links, and
-live HLS transcoding when a client can't play a file directly.
+metadata sidecars (`.info.json`, or Kodi/Emby-style `.nfo` for TV series and movies) — with
+multi-user accounts, per-user watch state, owner-controlled per-channel privacy, public share
+links, server-to-server federation, two-way Plex watch-state sync, and live HLS transcoding when
+a client can't play a file directly.
 
 Run it on your own hardware (NAS, home server, mini-PC) and watch in any browser — or with the
 native **iPhone / iPad / Apple TV**, **Google TV**, and **Samsung TV (Tizen)** apps, which talk to
@@ -13,9 +14,11 @@ this server over its [documented API](docs/api.md).
 - 📚 **Read-only** — your library is mounted `:ro`; MytView never writes to, moves, or deletes your files.
 - 👥 **Multi-user** — per-person sign-in, watch state, and resume points. Invite-based signup; the owner can reset passwords, deactivate, or remove accounts. Per-device session management with server-side revocation.
 - 🔦 **Per-channel privacy** — mark channels public or private and grant private ones to specific people, from a per-user × per-channel grid.
-- 📺 **Channels and series** — one server handles both creator-channel libraries (`.info.json` sidecars) and TV-series libraries (`.nfo` + `S01E02` naming), with season/episode ordering and next-episode tracking. Libraries are configured in the UI, not env vars.
+- 📺 **Channels, series, and movies** — creator-channel libraries (`.info.json` sidecars), TV-series libraries (`.nfo` + `S01E02` naming, season/episode ordering, next-episode tracking), and movie libraries (Radarr/Kodi layout, a 2:3 poster wall with genre filters and sort). Libraries are configured in the UI, not env vars; fully-watched shows tidy themselves out of the grids until something new arrives.
 - 🎞️ **Direct-play first, live HLS fallback** — every client tries the original file first; when it can't decode it, the server live-transcodes an ephemeral HLS stream that starts in seconds (VAAPI hardware encode when available, CPU fallback). Nothing is pre-transcoded or stored long-term.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
+- 🌐 **Federation** — pair two MytView servers and share chosen channels, shows, or whole libraries with another household. Their catalog merges into your own libraries (browse, search, and watch state stay on *your* server) while video streams flow **directly** from the sharing server to the viewer — plus per-peer concurrent-stream caps and consumption stats for the sharer.
+- 🔄 **Plex sync** — two-way watched-state and resume-point sync with a Plex server on the same library. Each user links their own Plex account (plex.tv PIN flow); years of existing Plex history import on the first sync, and an unwatch in either app propagates to the other.
 
 Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
 
@@ -70,6 +73,11 @@ that, signup requires a single-use invite (from `/invite`) unless `ALLOW_SIGNUP=
 | `TRANSCODE_HWACCEL` | `0` | `1` = Intel VAAPI hardware encode for live HLS (needs `/dev/dri` passthrough; amd64). Falls back to CPU automatically. |
 | `HLS_DIR` | `/transcodes/hls` | Where live-HLS session segments are written. `off` disables live transcoding (direct-play only). |
 | `SCAN_INTERVAL` | `5` | Auto-rescan interval in minutes (`0` disables). Incremental and cheap. |
+| `EXTERNAL_URL` | — | The public address federation invites embed — needed only to **share** via federation and only when the auto-detected address is wrong (e.g. a bare `ip:port` server without TLS). |
+
+Federation and Plex sync are configured **in the app**, not the environment: pairing, library
+mappings, sync cadence, and per-peer stream caps live on the owner pages; what gets shared is
+picked on the Sharing page; each user links Plex from their own Account page.
 
 Baked into the image (override only if you must): `PORT=8700`, `HOST=0.0.0.0`,
 `MEDIA_ROOT=/media`, `DB_PATH=/data/index.db`, `TRANSCODE_DIR=/transcodes`.
@@ -95,7 +103,31 @@ any subfolder of `/media` can be its own library:
   and local artwork (`poster.jpg`, `fanart.jpg`, `-thumb.jpg`), the layout media managers write.
   Falls back to `SxxExx` filename parsing when no `.nfo` exists.
 
-With no libraries configured, the whole of `/media` is treated as one public channels library.
+- **Movies** — `Movie Name (2024)/Movie Name (2024).mkv` with `movie.nfo` + `poster.jpg`/
+  `fanart.jpg` (the Radarr/Kodi layout). Rendered as a poster wall with genre filters and
+  title/year/recently-added sorting.
+
+Libraries are explicit: with none configured, nothing is indexed and the first-run screen walks
+the owner through adding one (any subfolder — or the root — per library).
+
+## Federation (share with another household)
+
+Two MytView servers can peer: one owner mints a single-use invite, the other pastes it, and the
+sharer then picks channels/shows/libraries to share on the Sharing page (a whole-library share
+covers future content automatically). The consumer maps each shared library into one of their
+own — or a new virtual library — and it merges seamlessly: same feed, search, tags, and per-user
+watch state, all served by the consumer's server. **Media never relays**: playback streams
+directly from the sharing server to the viewer's device via short-lived signed URLs, so a slow
+home uplink is never in the middle. Duplicate items (the same movie on both servers) collapse
+automatically — the local copy wins.
+
+## Plex sync
+
+If a Plex Media Server serves the same files, MytView keeps watch state agreed both ways:
+watched flags and resume positions sync per user, in both directions, every few minutes. Items
+pair by tmdb/imdb/tvdb ids with a file-path fallback; the first sync imports existing Plex
+history without un-watching anything. Setup: the owner sets the Plex address on their Account
+page; each user links their own Plex account there via plex.tv/link.
 
 ## Clients & API
 
