@@ -91,9 +91,15 @@ export function db(): Database.Database {
 	ensureColumn(d, 'videos', 'year', 'INTEGER');
 	ensureColumn(d, 'videos', 'poster_path', 'TEXT');
 	ensureColumn(d, 'channels', 'genres', 'TEXT');
-	// The season index references the just-migrated columns, so it CANNOT live in SCHEMA (which runs
-	// before these ALTERs) — create it here, once the columns exist (fresh via CREATE TABLE, else ALTER).
+	// Federation: NULL = local (scan-owned) row; a 12-hex peer prefix = mirrored from that peer
+	// (sync-owned — the scan's prune/existing/hasRows all filter peer_id IS NULL, and fedsync.ts
+	// prunes per-prefix). See docs/federation-design.md §7.
+	ensureColumn(d, 'channels', 'peer_id', 'TEXT');
+	ensureColumn(d, 'videos', 'peer_id', 'TEXT');
+	// The season + peer indexes reference just-migrated columns, so they CANNOT live in SCHEMA (which
+	// runs before these ALTERs) — create them here, once the columns exist (fresh via CREATE TABLE, else ALTER).
 	d.exec('CREATE INDEX IF NOT EXISTS idx_videos_season ON videos(channel_id, season_number, episode_number)');
+	d.exec('CREATE INDEX IF NOT EXISTS idx_videos_peer ON videos(peer_id)');
 	// One-time backfill when video_tags was just added to an existing index.db (empty tag
 	// index but populated videos). The scan maintains it incrementally afterwards, so this
 	// only pays the json_each cost once, at startup, instead of on every request.

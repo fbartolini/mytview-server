@@ -44,12 +44,20 @@ function secret(): Buffer {
 	return (_secret = Buffer.from(hex as string, 'hex'));
 }
 
-function mac(kind: MediaKind, id: string, exp: number): string {
-	return createHmac('sha256', secret()).update(`${kind}:${id}:${exp}`).digest('base64url');
+function mac(kind: MediaKind, id: string, exp: number, tag = ''): string {
+	// `tag` (federation link attribution — fedmeter.ts) is FOLDED INTO the MAC when present, so it
+	// can be neither forged onto an untagged URL nor stripped from a tagged one. Absent tag keeps
+	// the original MAC shape — every previously-minted URL stays valid.
+	const body = tag ? `${kind}:${id}:${exp}:${tag}` : `${kind}:${id}:${exp}`;
+	return createHmac('sha256', secret()).update(body).digest('base64url');
 }
 
 /** A signed relative URL for a media/image route, e.g. `/thumb/abc?k=…&exp=…`. */
-export function signedPath(kind: MediaKind, id: string, opts: { ttlS?: number } = {}): string {
+export function signedPath(
+	kind: MediaKind,
+	id: string,
+	opts: { ttlS?: number; tag?: string } = {}
+): string {
 	const ttl = opts.ttlS ?? DEFAULT_TTL_S;
 	// Window-ALIGN the expiry rather than `now + ttl`. A per-request exp changed the signed URL on every
 	// call, so the SAME image got a NEW URL on every list refetch. That changes the image model on the
@@ -59,7 +67,8 @@ export function signedPath(kind: MediaKind, id: string, opts: { ttlS?: number } 
 	// stays valid for between 1 and 2 ttls (+2 windows guarantees ≥1 ttl of validity even at a window's end).
 	const now = Math.floor(Date.now() / 1000);
 	const exp = (Math.floor(now / ttl) + 2) * ttl;
-	return `/${kind}/${encodeURIComponent(id)}?k=${mac(kind, id, exp)}&exp=${exp}`;
+	const t = opts.tag ? `&t=${encodeURIComponent(opts.tag)}` : '';
+	return `/${kind}/${encodeURIComponent(id)}?k=${mac(kind, id, exp, opts.tag ?? '')}&exp=${exp}${t}`;
 }
 
 // Window-aligned expiry (see signedPath) — a stable URL within the window.
@@ -71,9 +80,10 @@ function windowExp(ttlS: number): number {
 /** Signed HLS media-playlist URL for a video: `/hls/v/<id>/index.m3u8?k=&exp=` (id = VIDEO id). AVPlayer/
  *  hls.js fetch it with no auth header. Segments carry a SEPARATE signature keyed by the session id — see
  *  `hlsQuery`, used to sign each segment line the playlist emits. */
-export function signedHlsIndex(videoId: string, ttlS = DEFAULT_TTL_S): string {
+export function signedHlsIndex(videoId: string, ttlS = DEFAULT_TTL_S, tag?: string): string {
 	const exp = windowExp(ttlS);
-	return `/hls/v/${encodeURIComponent(videoId)}/index.m3u8?k=${mac('hls', videoId, exp)}&exp=${exp}`;
+	const t = tag ? `&t=${encodeURIComponent(tag)}` : '';
+	return `/hls/v/${encodeURIComponent(videoId)}/index.m3u8?k=${mac('hls', videoId, exp, tag ?? '')}&exp=${exp}${t}`;
 }
 
 /** The signed `k=…&exp=…` query for a session's HLS segment URLs (id = SESSION id). One signature covers
@@ -106,6 +116,6 @@ export function verifyMedia(kind: MediaKind, id: string, url: URL): boolean {
 	const exp = parseInt(expRaw, 10);
 	if (!Number.isFinite(exp) || exp * 1000 < Date.now()) return false;
 	const a = Buffer.from(k);
-	const b = Buffer.from(mac(kind, id, exp));
+	const b = Buffer.from(mac(kind, id, exp, url.searchParams.get('t') ?? ''));
 	return a.length === b.length && timingSafeEqual(a, b);
 }

@@ -4,6 +4,9 @@ import { canSeeChannel } from '$lib/server/visibility';
 import { getWatch, watchedAtSeconds, resumePosition } from '$lib/server/watch';
 import { signedPath, signedHlsIndex } from '$lib/server/mediaToken';
 import { hlsEnabled } from '$lib/server/hls';
+import { fedPlaybackUrls, FedError } from '$lib/server/fedclient';
+import { fedIdParts, linkByPrefix } from '$lib/server/federation';
+import { runFedSync } from '$lib/server/fedsync';
 import type { RequestHandler } from './$types';
 
 // Video detail for the player screen — one round-trip: full metadata (incl. tags + chapters), this
@@ -51,6 +54,27 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		poster,
 		canTranscode: false
 	};
+
+	// FEDERATED video: media streams DIRECT from the peer — the descriptor's url/hlsUrl become
+	// ABSOLUTE peer-signed URLs (all clients pass absolute URLs through verbatim — contract
+	// §Federation). `poster` stays the HOME-origin signed thumb (art is proxied+cached, design §8).
+	// Peer says not_shared → our mirror is stale: 404 + a background sync to self-heal. Peer
+	// unreachable → an explicit 503 (never a hang or a fake decode error).
+	if (video.peer_id != null) {
+		try {
+			const abs = await fedPlaybackUrls(video.id);
+			playback.url = abs.url;
+			playback.hlsUrl = abs.hlsUrl;
+		} catch (e) {
+			if (e instanceof FedError && e.kind === 'network') {
+				throw error(503, 'peer server unreachable');
+			}
+			const parts = fedIdParts(video.id);
+			const link = parts ? linkByPrefix(parts.prefix, 'consumer') : null;
+			if (link) void runFedSync(link.id);
+			throw error(404, 'video not found');
+		}
+	}
 
 	const watch = getWatch(locals.user.id, video.id);
 	// Server-owned watch decisions so every client seeks/marks identically (see watch.ts).

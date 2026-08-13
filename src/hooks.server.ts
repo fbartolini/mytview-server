@@ -2,6 +2,8 @@ import type { Handle, ServerInit } from '@sveltejs/kit';
 import { SCAN_ON_START, SCAN_INTERVAL_MIN } from '$lib/server/config';
 import { db } from '$lib/server/db';
 import { runScan } from '$lib/server/indexer';
+import { maybeAutoFedSync } from '$lib/server/fedsync';
+import { maybeAutoPlexSync } from '$lib/server/plexsync';
 import { stateDb } from '$lib/server/state';
 import { userForSession, touchSession, SESSION_COOKIE } from '$lib/server/auth';
 import { shareGrantsMedia, shareGrantsThumb } from '$lib/server/share';
@@ -22,6 +24,18 @@ export const init: ServerInit = () => {
 
 	// Periodic incremental rescan to pick up new downloads (cheap; mtime-gated).
 	if (SCAN_INTERVAL_MIN > 0) setInterval(() => void runScan(), SCAN_INTERVAL_MIN * 60_000);
+
+	// Federation catalog sync — cadence is an OWNER SETTING (app_meta 'fed_sync_min', default 30min
+	// vs the scan's 5 — network I/O against someone else's home server), so the driver ticks every
+	// minute and the setting decides; changes apply with no restart. First tick after boot syncs
+	// immediately (convergence). No-op with no consumer links or cadence 0.
+	void maybeAutoFedSync();
+	setInterval(() => void maybeAutoFedSync(), 60_000);
+
+	// Plex watch-progress sync — same minute-tick pattern (cadence is the app_meta 'plex_sync_min'
+	// owner setting; no-op until the owner sets the PMS address). docs/plex-sync.md.
+	void maybeAutoPlexSync();
+	setInterval(() => void maybeAutoPlexSync(), 60_000);
 };
 
 // Populate locals.user from the session cookie and gate everything behind login.
@@ -44,7 +58,11 @@ export const handle: Handle = async ({ event, resolve }) => {
 		pathname === '/link/web' || // self-authenticates via a single-use punch-out code (auth.ts)
 		pathname === '/api/v1/auth/login' ||
 		pathname === '/api/v1/auth/device/start' ||
-		pathname === '/api/v1/auth/device/poll';
+		pathname === '/api/v1/auth/device/poll' ||
+		// Server↔server federation surface: every endpoint self-authenticates (pair via a single-use
+		// invite; the rest via the link secret in the Bearer header — which is NOT a session token, so
+		// userForSession above already yielded null). See fedserve.ts / docs/federation-design.md.
+		pathname.startsWith('/api/fed/');
 
 	// Public share links: the /s/[token] viewer page, and token-scoped media/thumb for the ONE
 	// shared video. The token must match the exact id in the path — this is never a blanket
@@ -110,7 +128,12 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (!event.locals.user && !authRoute && !shareOk && !signedOk) {
 		// APIs / media answer 401; page requests get bounced to the login screen.
 		if (pathname.startsWith('/api/') || /^\/(media|thumb|poster|fanart|hls)\//.test(pathname)) {
-			return new Response('Unauthorized', { status: 401 });
+			// The media 401 carries CORS too (below) so a federated hls.js reads a real 401, not an
+			// opaque CORS failure, when a signature expires.
+			const headers = /^\/(hls|media)\//.test(pathname)
+				? { 'access-control-allow-origin': '*' }
+				: undefined;
+			return new Response('Unauthorized', { status: 401, headers });
 		}
 		// Bounce WITH the return path (login's safeNext brings them back after signing in) — e.g. a
 		// logged-out phone opening the TV pairing QR (/link?code=…) must land back on /link with the
@@ -126,6 +149,13 @@ export const handle: Handle = async ({ event, resolve }) => {
 	// HLS no-store) are left alone.
 	if (pathname.startsWith('/api/') && !res.headers.has('cache-control')) {
 		res.headers.set('cache-control', 'no-store');
+	}
+	// Cross-origin federated playback (design §9): hls.js on a CONSUMER's web origin XHRs this
+	// server's signed /hls playlist + segments (GET, no custom headers → no preflight; the `?k=`
+	// signature is the credential — allow-origin:* leaks nothing). /media included for
+	// <video crossorigin> / future MSE paths. Plain <video src>/<img> never needed CORS.
+	if (/^\/(hls|media)\//.test(pathname)) {
+		res.headers.set('access-control-allow-origin', '*');
 	}
 	return res;
 };

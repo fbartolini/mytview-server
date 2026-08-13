@@ -11,6 +11,8 @@ import {
 	type LibraryFormat
 } from '$lib/server/libraries';
 import { runScan } from '$lib/server/indexer';
+import { listLibraryMaps, getLink } from '$lib/server/federation';
+import { purgeLinkRows } from '$lib/server/fedsync';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = ({ locals }) => {
@@ -58,8 +60,14 @@ export const actions: Actions = {
 		if ('error' in p) return fail(400, { error: p.error });
 		try {
 			updateLibrary(id, p.name, p.path, p.format, p.newPrivate, p.showInRecent);
-		} catch {
-			return fail(400, { error: 'Another library already uses that folder.' });
+		} catch (e) {
+			// format-locked = this library receives federated content of its current format (libraries.ts).
+			return fail(400, {
+				error:
+					e instanceof Error && e.message.startsWith('format-locked')
+						? 'This library receives federated content — its format is locked while mapped.'
+						: 'Another library already uses that folder.'
+			});
 		}
 		void runScan(true); // folder/format may have changed → FULL re-index so items re-assign
 		return { ok: true };
@@ -69,6 +77,12 @@ export const actions: Actions = {
 		if (!isOwner(locals.user)) throw error(403);
 		const id = Number((await request.formData()).get('id'));
 		if (!Number.isInteger(id) || id <= 0) return fail(400, { error: 'Bad library id.' });
+		// Mirrored federation rows are NOT scan-pruned (peer_id filters) — purge them now for any
+		// mapping that targeted this library; the map rows themselves cascade with the library row.
+		for (const m of listLibraryMaps().filter((m) => m.local_library_id === id)) {
+			const link = getLink(m.link_id);
+			if (link) purgeLinkRows(link.peer_prefix, id);
+		}
 		deleteLibrary(id); // removes the config; its channels/videos are pruned on the next scan
 		void runScan(true); // FULL re-index so the removed library's items are cleared + the rest re-settle
 		return { ok: true };

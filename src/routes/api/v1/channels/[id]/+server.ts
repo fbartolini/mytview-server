@@ -6,7 +6,9 @@ import type { VideoSummary } from '$lib/types';
 import type { RequestHandler } from './$types';
 
 // One channel + its videos (newest first; a series returns all episodes in season/episode order; a
-// movies channel returns all movies — `?sort=title|year|added`, default title), each carrying
+// movies channel hides watched movies by default like a flat channel — since 2026-08-12, contract
+// §Movies; hidden count = channel.video_count - videos.length — `?sort=title|year|added`, default
+// title), each carrying
 // `directPlay`/`isVertical` flags, a signed thumb URL (movies also a signed 2:3 `poster` URL), and this
 // user's watch state; the channel carries signed poster/fanart + `isHidden`. For a series, `nextEpisode`
 // is the server-owned continue pointer (first unwatched episode in order, or null). `?watched=1`

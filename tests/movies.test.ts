@@ -195,7 +195,7 @@ describe('movies library', () => {
 		const lib = listLibraries().find((l) => l.path === 'Movies')!;
 		// On by default — freshly-written files (mtime = now) surface in the feed.
 		expect(listVideos({ userId: uid }).some((v) => v.id === 'tmdb-949')).toBe(true);
-		updateLibrary(lib.id, lib.name, lib.path, lib.format, lib.newPrivate, false);
+		updateLibrary(lib.id, lib.name, lib.path!, lib.format, lib.newPrivate, false);
 		// The FEED drops the whole library…
 		expect(listVideos({ userId: uid }).some((v) => v.id === 'tmdb-949')).toBe(false);
 		// …but search and genre/tag browsing still reach it (the opt-out is FEED-ONLY by design).

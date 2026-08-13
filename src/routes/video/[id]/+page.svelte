@@ -4,6 +4,7 @@
 	import RelatedVideos from '$lib/components/RelatedVideos.svelte';
 	import ShareDialog from '$lib/components/ShareDialog.svelte';
 	import { fmtDuration, fmtViews, fmtDate, relDate } from '$lib/format';
+	import { copyText } from '$lib/copy';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -21,29 +22,6 @@
 		setTimeout(() => (copied = false), 1500);
 	}
 
-	// execCommand('copy') is deprecated, but it's the only clipboard path that
-	// works in an *insecure* context — which is how this app is usually reached
-	// (plain HTTP over the LAN by IP). Chromium hides both navigator.share and
-	// navigator.clipboard on http://<ip>, so without this fallback the button
-	// silently did nothing in Brave/Chrome. Safari is laxer, hence its share sheet.
-	function legacyCopy(text: string): boolean {
-		try {
-			const ta = document.createElement('textarea');
-			ta.value = text;
-			ta.setAttribute('readonly', '');
-			ta.style.position = 'fixed';
-			ta.style.top = '-1000px';
-			ta.style.opacity = '0';
-			document.body.appendChild(ta);
-			ta.select();
-			const ok = document.execCommand('copy');
-			document.body.removeChild(ta);
-			return ok;
-		} catch {
-			return false;
-		}
-	}
-
 	async function shareSource() {
 		const url = v.webpage_url;
 		if (!url) return;
@@ -56,19 +34,10 @@
 				/* user dismissed → fall through to copy */
 			}
 		}
-		// 2) Async Clipboard API — present only in secure contexts (HTTPS/localhost).
-		try {
-			if (navigator.clipboard?.writeText) {
-				await navigator.clipboard.writeText(url);
-				flashCopied();
-				return;
-			}
-		} catch {
-			/* fall through to the legacy path */
-		}
-		// 3) Legacy execCommand — works over plain-HTTP LAN.
-		if (legacyCopy(url)) flashCopied();
-		// 4) Last resort: at least surface the URL to copy by hand.
+		// 2) Clipboard with the plain-HTTP LAN fallback ($lib/copy — this page's original helper,
+		// now shared with the admin copy buttons that had silently broken on http://<ip>).
+		if (await copyText(url)) flashCopied();
+		// 3) Last resort: at least surface the URL to copy by hand.
 		else window.prompt('Copy this link:', url);
 	}
 
@@ -88,21 +57,39 @@
 <div class="grid items-start gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_340px]">
 	<div>
 		{#key v.id}
-			<Player
-				id={v.id}
-				title={v.title}
-				channel={v.channel_name}
-				thumbPath={v.thumb_path}
-				watch={data.watch}
-				watchedAt={data.watchedAt}
-				resumePosition={data.resumePosition}
-				autoplayNext={data.prefs.autoplayNext && v.channel_kind !== 'movies'}
-				stillWatchingAfter={data.prefs.stillWatchingAfter}
-				preferCompat={data.preferCompat}
-				hlsEnabled={data.hlsEnabled}
-				width={v.width}
-				height={v.height}
-			/>
+			{#if data.peerUnavailable}
+				<!-- Federated video whose peer server didn't answer: the metadata below is local and fine,
+				     but there is nothing to stream. Explicit state — never a fake decode error. -->
+				<div
+					class="flex aspect-video items-center justify-center rounded-xl border border-dashed border-line bg-base-200 p-8 text-center"
+				>
+					<div>
+						<div class="mb-1 font-medium">The server this video lives on isn’t reachable right now.</div>
+						<div class="font-mono text-xs text-muted">
+							It streams directly from a federated peer — try again when that server is back online.
+						</div>
+					</div>
+				</div>
+			{:else}
+				<Player
+					id={v.id}
+					title={v.title}
+					channel={v.channel_name}
+					thumbPath={v.thumb_path}
+					watch={data.watch}
+					watchedAt={data.watchedAt}
+					resumePosition={data.resumePosition}
+					autoplayNext={data.prefs.autoplayNext && v.channel_kind !== 'movies'}
+					stillWatchingAfter={data.prefs.stillWatchingAfter}
+					preferCompat={data.preferCompat}
+					hlsEnabled={data.hlsEnabled}
+					srcUrl={data.srcUrl}
+					hlsUrl={data.hlsUrl}
+					remote={data.remote}
+					width={v.width}
+					height={v.height}
+				/>
+			{/if}
 		{/key}
 
 		<h1 class="mt-4 text-xl leading-tight font-bold">{v.title}</h1>

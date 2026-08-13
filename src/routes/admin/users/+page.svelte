@@ -1,17 +1,18 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
+	import { copyText } from '$lib/copy';
 	import type { ActionData, PageData } from './$types';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 
 	let copied = $state(false);
 	async function copy(text: string) {
-		try {
-			await navigator.clipboard.writeText(text);
+		// copyText handles the plain-HTTP LAN case (no navigator.clipboard there — $lib/copy).
+		if (await copyText(text)) {
 			copied = true;
 			setTimeout(() => (copied = false), 1500);
-		} catch {
-			/* clipboard blocked; the field is selectable */
+		} else {
+			window.prompt('Copy this link:', text);
 		}
 	}
 

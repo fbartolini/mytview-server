@@ -13,27 +13,39 @@
 	let { data }: { data: PageData } = $props();
 	const c = $derived(data.channel);
 	const isMovies = $derived(c.kind === 'movies');
-	const base = $derived(`/channel/${encodeURIComponent(c.id)}`);
-	const toggleHref = $derived(data.showWatched ? base : `${base}?watched=1`);
-	// Movies wall genre filter — CLIENT-side over the fully-delivered list (each movie carries its
+	// Show/hide watched, preserving the other params (?sort on the movies wall) — same toggle as the
+	// /channels grid.
+	const toggleHref = $derived.by(() => {
+		const url = new URL(page.url);
+		if (data.showWatched) url.searchParams.delete('watched');
+		else url.searchParams.set('watched', '1');
+		return url.pathname + url.search;
+	});
+	// Movies wall genre filter — CLIENT-side over the delivered list (each movie carries its
 	// `genres`); the chip options come from the channel's aggregate. No refetch, no query param.
 	let genre = $state<string | null>(null);
 	// "Show watched" is incremental: it ADDS watched videos to the unwatched ones (shows everything).
 	// The default view shows only unwatched, live-dropping a card the instant it's marked watched.
-	// Movies are the exception: the poster wall IS the collection — always everything, watched badges
-	// instead of absence (the server returns all; don't re-filter here — except the genre chips).
+	// Movies included since 2026-08-12 (the wall-is-the-collection exemption was reversed — the server
+	// already delivers only unwatched movies by default; the filter here is just the live drop).
+	const unwatchedLive = $derived(
+		data.showWatched
+			? data.videos
+			: data.videos.filter((v) => !($watchUpdates[v.id]?.watched ?? v.watched ?? false))
+	);
 	const shown = $derived(
-		isMovies
-			? genre
-				? data.videos.filter((v) => v.genres?.includes(genre!))
-				: data.videos
-			: data.showWatched
-				? data.videos
-				: data.videos.filter((v) => !($watchUpdates[v.id]?.watched ?? v.watched ?? false))
+		isMovies && genre ? unwatchedLive.filter((v) => v.genres?.includes(genre!)) : unwatchedLive
 	);
 	// "Everything watched" in the default (unwatched-only) view — keyed off `shown` so it's right for
-	// both channels (load returns only unwatched) and series (load returns ALL episodes → filtered here).
-	const allWatched = $derived(!data.showWatched && !isMovies && c.video_count > 0 && shown.length === 0);
+	// channels (load returns only unwatched), series (load returns ALL episodes → filtered here), and
+	// the movies wall (load returns only unwatched; suppressed while a genre chip narrows the list).
+	const allWatched = $derived(
+		!data.showWatched && !(isMovies && genre) && c.video_count > 0 && shown.length === 0
+	);
+	// Movies wall: how many the default view is hiding (video_count is the full collection size).
+	const hiddenWatched = $derived(
+		isMovies && !data.showWatched ? c.video_count - data.videos.length : 0
+	);
 
 	// Movies sort — a <select> mirroring the /channels listing pages (⇔ their setSort), so the movies
 	// wall reads as a sibling LIBRARY page, not a channel detail. 'title' is the default → drop the param.
@@ -55,7 +67,11 @@
 	     art, which rendered as a large blank slab). -->
 	<div class="mb-5 flex items-baseline gap-3">
 		<h1 class="text-xl font-bold capitalize tracking-tight">{c.name}</h1>
-		<span class="font-mono text-xs text-faint">{c.video_count} movies</span>
+		<span class="font-mono text-xs text-faint"
+			>{data.videos.length} movies{hiddenWatched > 0
+				? ` · ${hiddenWatched} watched hidden`
+				: ''}</span
+		>
 		<select
 			aria-label="Sort"
 			value={data.sort}
@@ -66,6 +82,9 @@
 			<option value="year">Year</option>
 			<option value="added">Recently added</option>
 		</select>
+		<a href={toggleHref} class="font-mono text-xs text-muted hover:text-base-content">
+			{data.showWatched ? '× hide watched' : 'show watched'}
+		</a>
 	</div>
 {:else}
 <a
@@ -159,7 +178,7 @@
 
 {#if allWatched}
 	<div class="rounded-xl border border-dashed border-line p-10 text-center font-mono text-sm text-muted">
-		You’ve watched everything from this channel.
+		You’ve watched {isMovies ? 'every movie here' : 'everything from this channel'}.
 		<a href={toggleHref} class="text-primary hover:underline">show watched</a>
 	</div>
 {:else if isMovies}

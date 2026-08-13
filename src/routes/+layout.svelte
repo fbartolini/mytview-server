@@ -285,8 +285,9 @@
 			{@render menulink('/sessions', 'Devices')}
 			{#if data.canInvite}{@render menulink('/invite', 'Invite someone')}{/if}
 			{#if data.isOwner}{@render menulink('/admin/libraries', 'Libraries')}{/if}
-			{#if data.isOwner}{@render menulink('/admin/visibility', 'Channel visibility')}{/if}
+			{#if data.isOwner}{@render menulink('/admin/visibility', 'Sharing')}{/if}
 			{#if data.isOwner}{@render menulink('/admin/users', 'Users')}{/if}
+			{#if data.isOwner}{@render menulink('/admin/federation', 'Federation')}{/if}
 
 			<div class="border-t border-line-soft"></div>
 			<button

@@ -17,7 +17,7 @@ this server over its [documented API](docs/api.md).
 - 🎞️ **Direct-play first, live HLS fallback** — every client tries the original file first; when it can't decode it, the server live-transcodes an ephemeral HLS stream that starts in seconds (VAAPI hardware encode when available, CPU fallback). Nothing is pre-transcoded or stored long-term.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
 
-Website: **https://mytview.com** · Privacy: **https://link.mytview.com/privacy**
+Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
 
 ---
 

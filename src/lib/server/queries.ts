@@ -54,6 +54,17 @@ export function listChannels(
 	return rows.map((r) => ({ ...r, genres: parseGenres(r.genres) }));
 }
 
+/** The grid's hide-watched rule (contract §channels): a channel/series the default listing DROPS
+ *  because this user has watched every item in it — a finished show leaves the shows grid until a
+ *  new episode arrives, same convention as the feed hiding watched videos (`?watched=1` reveals).
+ *  Movies channels are exempt — watched MOVIES hide inside the wall (getChannel), but the library's
+ *  tile/tab itself never disappears (owner decision 2026-08-12) — and so are empty channels
+ *  (nothing there yet ≠ all seen). ONE definition shared by the web /channels load and
+ *  /api/{channels,v1/channels} so every client renders the same list. */
+export const isFullyWatched = (
+	c: Pick<ChannelSummary, 'kind' | 'video_count' | 'unwatched'>
+): boolean => c.kind !== 'movies' && c.video_count > 0 && c.unwatched === 0;
+
 const parseGenres = (raw: string | null): string[] | null => {
 	if (!raw) return null;
 	try {
@@ -128,9 +139,11 @@ export function getChannel(
 		.all({
 			uid: userId,
 			cid: id,
-			// Series AND movies always list everything (the collection view — watched shows a badge, not
-			// absence); the hide-watched feed behavior stays a channels-format thing.
-			showAll: channel.kind === 'series' || channel.kind === 'movies' || showWatched ? 1 : 0
+			// Series always list everything (the episode list IS the show's structure — watched shows a
+			// badge, not absence; the web hides watched client-side over the full list). Channels AND
+			// movies hide watched by default (`?watched=1` reveals) — movies joined 2026-08-12, reversing
+			// the original wall-is-the-collection exemption (owner decision; contract §Movies).
+			showAll: channel.kind === 'series' || showWatched ? 1 : 0
 		}) as (VideoRow & { tags: string | null })[];
 	const videos = rows.map((r) => {
 		const { tags, ...rest } = r;

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick, untrack } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { goto, invalidateAll } from '$app/navigation';
 	import { fmtDuration } from '$lib/format';
 	import { noteWatch } from '$lib/watchStore';
 	import type Hls from 'hls.js'; // type-only; the library itself is lazy-imported when a video needs HLS
@@ -18,6 +18,9 @@
 		stillWatchingAfter = 3,
 		preferCompat = false,
 		hlsEnabled = false,
+		srcUrl = null,
+		hlsUrl = null,
+		remote = false,
 		width = null,
 		height = null
 	}: {
@@ -41,9 +44,21 @@
 		// On-the-fly HLS is available on this server → on a decode failure the player switches to a
 		// seconds-to-start live transcode (hls.js / native). The ONLY fallback tier.
 		hlsEnabled?: boolean;
+		// FEDERATED playback (contract §Federation): the load supplies ABSOLUTE peer-signed URLs and
+		// the player uses them verbatim (the web mirror of the natives' absolute passthrough). Null =
+		// local video → the same-origin literals below. `remote` arms a one-shot URL refresh on error
+		// (peer-signed URLs expire; a page-data refresh re-mints them).
+		srcUrl?: string | null;
+		hlsUrl?: string | null;
+		remote?: boolean;
 		width?: number | null;
 		height?: number | null;
 	} = $props();
+
+	// Local defaults preserve the pre-federation same-origin behavior byte-for-byte.
+	const mediaSrc = $derived(srcUrl ?? `/media/${encodeURIComponent(id)}`);
+	const hlsSrc = $derived(hlsUrl ?? `/hls/v/${encodeURIComponent(id)}/index.m3u8`);
+	let refreshTried = false; // one-shot remote URL refresh per mount
 
 	let videoEl: HTMLVideoElement;
 	let watched = $state(untrack(() => watch.watched));
@@ -199,6 +214,18 @@
 			`[mytview build=skip] media error code=${err?.code ?? '?'} pos=${Math.round(lastPos)}s hls=${onHls} retries=${decodeRetries} — ${err?.message ?? ''}`
 		);
 		if (hlsFailed) return; // already gave up on HLS (the element has no source) — ignore stray errors
+		// Remote (federated) source: the peer-signed URLs expire (12–24h media / 2–4h HLS), and an
+		// expired signature surfaces as a fake decode/network error. Before any fallback ladder,
+		// refresh the page data ONCE — the load re-mints absolute URLs from the peer. A real failure
+		// recurs immediately and proceeds down the normal ladder. sessionEnded() below stays pinned to
+		// the HOME origin, so a peer-side 401 can never bounce the user to login.
+		if (remote && !refreshTried) {
+			refreshTried = true;
+			await invalidateAll();
+			videoEl?.load();
+			videoEl?.play?.().catch(() => {});
+			return;
+		}
 		if (onHls) {
 			// We're on the live HLS path — never fall back to the (undecodable) original; that just loops.
 			if (await sessionEnded()) return toLogin();
@@ -257,7 +284,7 @@
 				if (data.type === HlsCtor.ErrorTypes.NETWORK_ERROR) inst.startLoad();
 				else inst.recoverMediaError();
 			});
-			inst.loadSource(`/hls/v/${encodeURIComponent(id)}/index.m3u8`);
+			inst.loadSource(hlsSrc);
 			inst.attachMedia(videoEl);
 			videoEl?.play?.().catch(() => {});
 		} catch {
@@ -543,13 +570,7 @@
 		onerror={onError}
 		class={videoClass}
 		poster={thumbPath ? `/thumb/${encodeURIComponent(id)}` : undefined}
-		src={onHls
-			? hlsNative
-				? `/hls/v/${encodeURIComponent(id)}/index.m3u8`
-				: undefined
-			: hlsFailed
-				? undefined
-				: `/media/${encodeURIComponent(id)}`}
+		src={onHls ? (hlsNative ? hlsSrc : undefined) : hlsFailed ? undefined : mediaSrc}
 	></video>
 
 	{#if expanded}

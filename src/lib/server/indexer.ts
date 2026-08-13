@@ -657,8 +657,10 @@ export async function scan(full = false): Promise<ScanStats> {
 		   genres=COALESCE(excluded.genres, channels.genres)`
 	);
 
+	// LOCAL rows only (peer_id IS NULL) — mirrored federation rows are sync-owned: they must never
+	// feed the incremental-skip map, the prune, or the safety valve (fedsync.ts prunes per-peer).
 	const existing = new Map<string, { id: string; mtime: number }>();
-	for (const r of database.prepare('SELECT id, info_path, mtime FROM videos').all() as {
+	for (const r of database.prepare('SELECT id, info_path, mtime FROM videos WHERE peer_id IS NULL').all() as {
 		id: string;
 		info_path: string;
 		mtime: number;
@@ -717,8 +719,10 @@ export async function scan(full = false): Promise<ScanStats> {
 	// within seconds — the (full) re-parse of the established libraries queues BEHIND it, not in front
 	// of it. Order is otherwise stable. First boot (nothing indexed) trivially keeps table order.
 	const hasRows = database.prepare(
-		'SELECT 1 FROM channels c WHERE c.library_id IS ? AND EXISTS ' +
-			'(SELECT 1 FROM videos v WHERE v.channel_id = c.id) LIMIT 1'
+		// peer_id IS NULL: a mapped library holding only federated content is still NEVER-indexed
+		// locally — it must keep the walk-first ordering when its local folder first gets content.
+		'SELECT 1 FROM channels c WHERE c.library_id IS ? AND c.peer_id IS NULL AND EXISTS ' +
+			'(SELECT 1 FROM videos v WHERE v.channel_id = c.id AND v.peer_id IS NULL) LIMIT 1'
 	);
 	const isNewLib = (l: Library): boolean => !hasRows.get(l.id);
 	const ordered = [...libs.filter(isNewLib), ...libs.filter((l) => !isNewLib(l))];
@@ -765,10 +769,13 @@ export async function scan(full = false): Promise<ScanStats> {
 	// every request mid-scan. Chunked deletes mean a reader can briefly see a half-pruned index — the
 	// same progressive visibility the batched upserts above already have.
 	const PRUNE_CHUNK = 200;
-	const deadVideos = (database.prepare('SELECT id FROM videos').all() as { id: string }[])
+	// peer_id IS NULL: the scan prunes only rows the FILESYSTEM walk owns. Mirrored federation rows
+	// are pruned by their own sync (per-peer, only after a clean catalog) — a local scan must never
+	// touch them (docs/federation-design.md §11).
+	const deadVideos = (database.prepare('SELECT id FROM videos WHERE peer_id IS NULL').all() as { id: string }[])
 		.map((r) => r.id)
 		.filter((id) => !seenVideos.has(id));
-	const deadChannels = (database.prepare('SELECT id FROM channels').all() as { id: string }[])
+	const deadChannels = (database.prepare('SELECT id FROM channels WHERE peer_id IS NULL').all() as { id: string }[])
 		.map((r) => r.id)
 		.filter((id) => !seenChannels.has(id));
 	const delVideo = database.prepare('DELETE FROM videos WHERE id = ?');
@@ -822,7 +829,16 @@ function childLibraryDirs(lib: Library, all: Library[]): Set<string> {
  */
 async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>): Promise<void> {
 	const topDirs = (await fsp.readdir(lib.root, { withFileTypes: true }))
-		.filter((e) => e.isDirectory() && !excluded.has(e.name))
+		.filter((e) => {
+			if (!e.isDirectory() || excluded.has(e.name)) return false;
+			// 'fed:' is the reserved mirrored-content namespace (a dir named fed:* would shadow it —
+			// design §7). Series/movies are immune (their ids get 'series:'/'movies:' prefixes).
+			if (e.name.startsWith('fed:')) {
+				console.warn(`[mytview] scan: skipping reserved-name directory "${e.name}" in ${lib.name}`);
+				return false;
+			}
+			return true;
+		})
 		.map((e) => e.name)
 		.sort();
 
@@ -1167,16 +1183,25 @@ export function scanStatus(): ScanStatus {
 	};
 }
 
+/** For NON-scan writers that change the index (the federation sync): bump the completed-scan `seq`
+ *  so every surface that invalidates on seq movement (web nav, status pollers) picks the change up
+ *  without new plumbing. */
+export function noteExternalIndexChange(): void {
+	_seq++;
+}
+
 /** WS-I scan-time prebake: derive the card-size variants (thumb 480 / poster 320, the sizes the web
  *  and phone grids request) for everything indexed, SEQUENTIALLY through the bounded resize pipeline
  *  — so the warmer holds at most one slot and live requests always have capacity. Fire-and-forget
  *  after a scan that parsed anything; hits are single stat()s, failures fall back to originals. */
 async function warmImageCache(): Promise<void> {
+	// Local rows only — fed rows carry 'fed:*' path sentinels with no MEDIA_ROOT file behind them
+	// (their art is cached by fedart.ts, which does its own warming on fetch).
 	const videos = db()
-		.prepare('SELECT thumb_path, poster_path FROM videos')
+		.prepare('SELECT thumb_path, poster_path FROM videos WHERE peer_id IS NULL')
 		.all() as { thumb_path: string | null; poster_path: string | null }[];
 	const channels = db()
-		.prepare('SELECT poster_path FROM channels')
+		.prepare('SELECT poster_path FROM channels WHERE peer_id IS NULL')
 		.all() as { poster_path: string | null }[];
 	const jobs: [string | null, number][] = [
 		...videos.flatMap((v): [string | null, number][] => [[v.thumb_path, 480], [v.poster_path, 320]]),

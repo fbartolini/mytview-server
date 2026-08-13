@@ -42,6 +42,11 @@ shared binary across languages, so THIS is the shared layer. Two parts:
   relative URLs** (`/thumb/ID?k=…&exp=…`). Resolve against the base URL and fetch directly — **no auth
   header needed** on those. Do NOT construct or sign them client-side. For images, append `&w=<pixels>` to
   get a downscaled JPEG (server resizes + caches). `playback.url` supports HTTP Range / 206.
+  **FEDERATION AMENDMENT (0.4.2):** `playback.url`/`playback.hlsUrl` MAY be **absolute URLs to a
+  different host** (a federated peer). A client MUST pass an absolute URL through to its player
+  verbatim — no base-URL prefixing, and **never** an Authorization header or cookie on it (the
+  signature in the URL is the credential). All shipped clients already behave this way; this pins it.
+  Image URLs stay relative/home-origin always (§Federation).
 - **Errors:** `401` unauthenticated, `404` for a video/channel this user can't see (visibility is enforced
   server-side — the client inherits access control for free), `4xx/5xx` otherwise.
 
@@ -149,8 +154,8 @@ full re-parse of established libraries queues behind it), and channel `video_cou
 (nav tabs / `GET libraries` include the new library while its walk is still running — clients that fetch
 the libraries list once per launch will see it on their next fetch or via their status poll).
 **`capabilities`** (added 0.4.0) is the version-negotiation surface: an additive-only string list —
-currently `libraries | series | movies | sessions | prefs | shares` (+ `hls` when live transcode is
-enabled).
+currently `libraries | series | movies | sessions | prefs | shares | federation` (+ `hls` when live
+transcode is enabled; `federation` added 0.4.2 — see §Federation).
 Feature-gate on membership (absent field = pre-0.4.0 server: assume all of the above except judge `hls`
 by `playback.hlsUrl != null`); never probe endpoints and guess from 404s. `serverVersion` is for
 diagnostics display, not gating.
@@ -158,6 +163,9 @@ diagnostics display, not gating.
 ### `GET /api/v1/videos?offset=&limit=&watched=&q=&tag=`
 `{ items: [VideoSummary], page: { limit, offset, nextOffset } }` — `nextOffset` null = end.
 `watched=1` includes watched videos (incremental; default hides them). `q` = title search, `tag` = tag filter.
+`GET /api/v1/channels` also accepts `?sort=name|updated|unwatched` (default `name`) — the same keys the web
+/channels page uses; server-sorted, clients render response order. TV clients expose Name + Last updated
+(owner 2026-08-13; `unwatched` stays web-only).
 The owner can opt a LIBRARY out of the feed (`show_in_recent` on /admin/libraries — collections people
 browse deliberately, e.g. a movies archive): the plain feed silently omits it, while `q`/`tag` queries and
 the library's own pages still include everything. Enforced server-side — clients need no logic.
@@ -181,8 +189,8 @@ chapters: [{ start_time, end_time, title }], webpage_url`, and the server-owned:
 - `watchedAt` — seconds at which to auto-mark-watched (null = only at end-of-item)
 - `resumePosition` — seconds to seek to on open (null = start from the beginning; already gated server-side)
 
-### `GET /api/v1/channels?library=`
-`{ items: [Channel] }`. **Channel:** `{ id, name, kind, library_id, yt_channel_id, url, follower_count,
+### `GET /api/v1/channels?library=&watched=`
+`{ items: [Channel], watchedHidden }`. **Channel:** `{ id, name, kind, library_id, yt_channel_id, url, follower_count,
 poster_path, fanart_path, video_count, unwatched, poster, fanart, isHidden }` (`poster`/`fanart` = signed;
 `isHidden` = this user unsubscribed). **`kind`** ∈ `channel | series | movies`. **`unwatched`** = per-user
 count of not-watched items → render as an unread-style **badge**. **`library_id`** = the owning library
@@ -190,14 +198,31 @@ count of not-watched items → render as an unread-style **badge**. **`library_i
 re-assigns or prunes them; libraries are explicit-only now). Optional **`?library=<id>`** scopes the list to one library (mirrors the
 web nav tabs).
 
+**DECISION — the grid hides fully-watched channels/series by default (added 2026-08-12,
+server-side).** A channel/series in which this user has watched *every* item is **dropped from the
+default list** — a finished show leaves the shows grid until a new episode arrives — the same
+convention as the feed hiding watched videos. **`?watched=1` reveals everything** (⇔ `/api/v1/videos`
+semantics). Two exemptions, both server-owned (`isFullyWatched` in `queries.ts`): **movies channels
+never hide from the grid** — only the movies themselves hide, inside the wall (§Movies); the
+library's tile/tab always stays reachable — and **empty channels never hide** (nothing there yet ≠
+all seen). **`watchedHidden`** = how many rows the default
+view dropped — render a "show watched" reveal and an "all watched" empty state (distinct from a
+genuinely empty library) off it; web has both, native toggles are the tracked parity follow-up
+(matrix "Hide finished shows from the grid"). Clients never re-implement the predicate — reveal =
+refetch with `?watched=1`. `/api/v1/libraries` deliberately still counts fully-watched libraries, so
+a library tab never vanishes just because it's finished.
+
 ### `GET /api/v1/channels/[id]?watched=&sort=`
 `{ channel: Channel, videos: [VideoSummary], nextEpisode: VideoSummary | null }`. A **series**
 (`channel.kind === "series"`) returns **all** its episodes in season/episode order (watched ones included),
 and `nextEpisode` is the server-owned "continue" pointer (first unwatched episode, or null when the show is
-finished). A flat channel returns newest-first with `nextEpisode: null`. A **movies** channel returns all
-its movies (watched included, like series) with `nextEpisode: null`; **`?sort=title|year|added`** (movies
-only, default `title` — the poster-wall convention; server-ordered, don't re-sort client-side) and each
-item additionally carries a signed **`poster`** (2:3) next to `thumb` (16:9 fanart).
+finished). A flat channel returns newest-first with `nextEpisode: null`. A **movies** channel behaves
+like a flat channel for watched-hiding: **watched movies are dropped by default, `?watched=1` reveals
+the full collection** (DECISION REVERSED 2026-08-12 — before, movies returned everything watched-included
+like series; the hidden count a client may want = `channel.video_count - videos.length`). It keeps
+`nextEpisode: null`; **`?sort=title|year|added`** (movies only, default `title` — the poster-wall
+convention; server-ordered, don't re-sort client-side) and each item additionally carries a signed
+**`poster`** (2:3) next to `thumb` (16:9 fanart).
 
 ## §Movies (added 0.4.x — capability `movies`)
 
@@ -207,6 +232,14 @@ library). The rules every client mirrors:
   back to title-on-tile), NOT the 16:9 card grid. Everywhere else movies appear (Recent, search, related)
   they stay normal 16:9 cards — the server puts the FANART in `thumb` so this needs no client logic.
 - **Meta line:** year in the slot where channel videos show views; movies have no views/likes/SxE.
+- **Watched movies hide from the wall by default** (server-side in `getChannel` — `?watched=1`
+  reveals; DECISION REVERSED 2026-08-12, previously "the wall IS the collection, always everything").
+  Only the MOVIES hide: the library's synthetic channel/tab never disappears from grids or nav even
+  when fully watched (`isFullyWatched` exempts `kind='movies'` — §channels). Clients inherit the
+  hiding automatically (the default wall request has no `?watched`); the reveal is the same
+  channel-detail Show-watched toggle every native already has for flat channels — **stop suppressing
+  it on movies screens** (they gate it on `!isMovies` from the pre-reversal rule). Web additionally
+  shows "· N watched hidden" + an all-watched empty state.
 - **NO autoplay-chain:** when `channel_kind === 'movies'`, do not auto-advance at end of playback —
   show the end state (and the Related rail) instead. Watching a film must not slingshot into another
   one.
@@ -214,7 +247,8 @@ library). The rules every client mirrors:
   same library, ranked by idf-weighted overlap of **genres + top-billed cast (≤5) + director +
   collection** (the latter three indexed as namespaced `person:`/`set:` tag entries — the weighting
   naturally ranks shared-collection ≫ shared-person ≫ shared-genre), year-proximity tiebreak,
-  **watched included** (the rail is navigational — a collection hides nothing), zero-overlap movies
+  **watched included** (the rail is navigational — deliberately kept even after the wall began
+  hiding watched, 2026-08-12), zero-overlap movies
   fill by year proximity so the rail is never empty. Never channel videos, never a feed top-up.
   Detail `tags[]` never contains the namespaced entries — clients only ever see genres.
 - **Navigation:** a movies library's nav tab goes STRAIGHT to its poster wall (the synthetic channel),
@@ -225,7 +259,8 @@ library). The rules every client mirrors:
   never get local filters — genre filtering there is the server-side `?tag=` param. If a wall ever
   needs pagination (huge libraries), its filter/sort MUST move to server params in the same change
   (`?sort=` already exists; genre would become `?tag=` on `channels/[id]`).
-- **Sort + genre filter run CLIENT-side over the delivered list** (the wall arrives complete):
+- **Sort + genre filter run CLIENT-side over the delivered list** (the wall arrives complete *for
+  the active watched filter* — default = unwatched only, `?watched=1` = the full collection):
   sorting uses the same three contract keys as `?sort=` — title (case-insensitive), year DESC,
   added (`timestamp`) DESC — locally or via the param, identical result either way. For movies,
   `timestamp` is the DURABLE first-indexed date (`state.videos_seen`, seeded from file mtime on first
@@ -239,6 +274,43 @@ library). The rules every client mirrors:
   `categories` into their tags instead (browsable via /tag).
 - Everything else (watch state, resume, playback descriptor, HLS fail-open, visibility) is identical —
   a movie is a video row.
+
+## §Federation (added 0.4.2 — capability `federation`)
+
+Two MytView servers can peer: the owner maps a friend's shared libraries into their own, and the
+mirrored content flows through **every existing read** — feed, search, tags, grids, related, watch
+state — as ordinary rows. Full design + threat model: `docs/federation-design.md`. What a CLIENT
+needs to know is deliberately tiny:
+
+- **Browsing is transparent.** Federated channels/videos arrive through the normal `/api/v1`
+  reads with namespaced ids (`fed:<peer>:<id>`). Ids are opaque strings — clients must not parse
+  them. `VideoDetail`/items may carry **`peer_id`** (non-null = federated) — informational only
+  (a future "from Bob's server" badge); never branch playback on it.
+- **Playback: absolute passthrough** (the amendment in §Conventions): for a federated video the
+  descriptor's `url`/`hlsUrl` are absolute peer-signed URLs; play them verbatim, no credentials
+  attached. The `.m3u8` path always ends before the `?` (ExoPlayer MIME sniff). `compatUrl:null`
+  / `canTranscode:false` as always; HLS availability = `hlsUrl != null` (it is the PEER's HLS).
+- **Art is always home-origin** — thumbs/posters/fanart for federated content are proxied +
+  cached by the user's own server and served through the normal signed relative URLs. No client
+  image change, no CORS.
+- **New failure shape:** `GET /api/v1/videos/[id]` can return **`503` "peer server unreachable"**
+  when the video's peer is down (metadata reads still succeed — only the descriptor needs the
+  peer). Render it as "this server's peer is offline", not a decode error. A peer-side revocation
+  turns into an ordinary `404` (+ the mirror self-heals in the background).
+- **`/api/fed/*` is server↔server only** — clients never call it; the link secret is never
+  exposed to a client. Pairing/mappings are owner web-admin (`/admin/federation`); WHAT is shared
+  is chosen on the sharing matrix (`/admin/visibility`), where each federated server is one more
+  principal column — per-channel grants plus **whole-library grants that cover current AND future
+  content** (`fed_library_grants`; effective grant = union).
+- **DEDUPE — local content wins (2026-08-12).** The consumer's sync skips any remote video whose
+  RAW content id (yt/tvdb/tmdb-keyed) already exists locally, and a remote channel whose id+kind
+  matches a local channel in the target library merges INTO it (no duplicate tile; the remote
+  fills gaps only). Pre-existing duplicates self-heal on the next sync. Known limit: NFO-less
+  episodes use relpath-hashed fallback ids, which differ across servers and therefore don't
+  dedupe at the episode level.
+- **Requirements the operator owns** (surface in errors, don't work around): the SHARER must be
+  reachable by the viewer's device; https strongly recommended (iOS ATS blocks http absolute
+  URLs; browsers block mixed content).
 
 ### `GET /api/v1/libraries`
 `{ items: [{ id, name, format }] }` — the libraries **this user can see media in** (`format` ∈

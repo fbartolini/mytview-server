@@ -58,6 +58,10 @@ interface Session {
 	lastAccess: number;
 	lastFetched: number; // highest segment the player has requested — the play head, for the ahead-throttle
 	everFetched: boolean; // any segment ever requested — a never-fetched session is reusable/evictable
+	/** Federation attribution (fedmeter): set when the index request carried a MAC-covered link tag,
+	 *  so segment requests can be metered/capped per peer. Reused sessions keep their first owner's
+	 *  attribution (≤20s window — accepted noise). */
+	fed: { linkId: number; key: string } | null;
 	frontier: number;    // cached forward-only production frontier (first not-yet-produced seg); reset on spawn
 	paused: boolean;     // ffmpeg SIGSTOP'd because it raced > HLS_AHEAD_SEG ahead of the play head
 	hdr: boolean;        // source is HDR → tonemap on the CPU path (VAAPI is skipped for HDR)
@@ -138,7 +142,10 @@ const MAX_TOTAL_SESSIONS = HLS_MAX_SESSIONS * 4;
 
 /** Create (or reuse) a session for a video (called by the index.m3u8 route AFTER auth). Returns
  *  { sid, playlist } or null (disabled / unknown video / unreadable source / unknown duration / full). */
-export async function startHlsSession(videoId: string): Promise<{ sid: string; playlist: string } | null> {
+export async function startHlsSession(
+	videoId: string,
+	fed: { linkId: number; key: string } | null = null
+): Promise<{ sid: string; playlist: string } | null> {
 	if (!HLS_DIR) return null;
 	// Playlist refetch collapse: reuse a just-minted session for the same video that nobody has pulled
 	// a segment from yet (the Safari/AVPlayer multi-fetch at start), instead of minting a dir + probes
@@ -194,7 +201,7 @@ export async function startHlsSession(videoId: string): Promise<{ sid: string; p
 	sessions.set(sid, {
 		id: sid, videoId, srcAbs, dir, duration,
 		active: null, createdAt: Date.now(), lastAccess: Date.now(), lastFetched: 0, everFetched: false,
-		frontier: 0, paused: false, hdr
+		fed, frontier: 0, paused: false, hdr
 	});
 	startGc();
 	return { sid, playlist: buildPlaylist(sid, duration) };
@@ -215,6 +222,11 @@ function buildPlaylist(sid: string, duration: number): string {
 /** Ensure segment `n` of a session is produced (start / restart-at-offset / wait) and return its file
  *  PATH for the route to stream. null → capped / timed out / unknown session (route → 404/503). The `sid`
  *  is the capability (unguessable, handed out only by an authed index.m3u8) — same model as a share token. */
+/** The federation attribution (if any) of a live session — for the segment route's metering. */
+export function hlsSessionFed(sid: string): { linkId: number; key: string } | null {
+	return sessions.get(sid)?.fed ?? null;
+}
+
 export async function hlsSegment(sid: string, n: number): Promise<string | null> {
 	const s = sessions.get(sid);
 	if (!s || !Number.isInteger(n) || n < 0) return null;

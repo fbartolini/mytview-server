@@ -55,21 +55,48 @@
 
 	const miniBtn =
 		'rounded border border-line px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted transition-colors hover:border-primary/60 hover:text-base-content';
+
+	// Sections start COLLAPSED — the library row (with its whole-library share) is the overview;
+	// expand a section for per-channel detail. An active search/filter/focus force-expands so a
+	// match can never hide inside a collapsed section.
+	let open = $state<Record<string, boolean>>({});
+	const forceOpen = $derived(query !== '' || filter !== 'all' || focusUser !== null);
+	const isOpen = (id: number | null): boolean => forceOpen || !!open[String(id)];
+
+	// Rows grouped by LIBRARY (owner-defined order, unassigned last) — the library header row
+	// carries the whole-library federation share (current + future content).
+	const groups = $derived.by(() => {
+		const byLib = new Map<number | null, typeof data.channels>();
+		for (const c of data.channels) {
+			const k = c.library_id ?? null;
+			if (!byLib.has(k)) byLib.set(k, []);
+			byLib.get(k)!.push(c);
+		}
+		const out: { id: number | null; name: string; channels: typeof data.channels }[] = [];
+		for (const l of data.libraries) {
+			if (byLib.has(l.id)) out.push({ id: l.id, name: l.name, channels: byLib.get(l.id)! });
+		}
+		if (byLib.has(null)) out.push({ id: null, name: 'Unassigned', channels: byLib.get(null)! });
+		return out;
+	});
 </script>
 
-<svelte:head><title>Channel visibility · MytView</title></svelte:head>
+<svelte:head><title>Sharing · MytView</title></svelte:head>
 
 <a
 	href="/channels"
 	class="mb-4 inline-flex gap-1.5 font-mono text-xs text-muted hover:text-base-content">← channels</a
 >
 
-<h1 class="mb-1 text-xl font-bold">Channel visibility</h1>
+<h1 class="mb-1 text-xl font-bold">Sharing</h1>
 <p class="mb-5 max-w-[70ch] text-[13px] leading-relaxed text-muted">
-	Public channels are visible to everyone. Mark a channel <span class="text-base-content">private</span>
-	to hide it, then tick who it's shared with. You (the owner) always see everything. Use the
-	<span class="text-base-content">all / none</span> controls in each column header to change every
-	channel at once. <span class="text-faint">Changes save automatically.</span>
+	Who sees what — your <span class="text-base-content">users</span> and any
+	<span class="text-sky-300">⇄ federated servers</span>. Public channels are visible to every user;
+	mark one <span class="text-base-content">private</span> and tick who it's shared with. Federated
+	servers get nothing until ticked — use a library row's
+	<span class="text-base-content">whole</span> toggle to share everything in it, current and future,
+	or expand the library for per-channel control.
+	<span class="text-faint">Changes save automatically.</span>
 </p>
 
 {#if data.channels.length === 0}
@@ -118,7 +145,7 @@
 				<div
 					class="min-w-[9rem] flex-1 font-mono text-[10px] font-semibold tracking-widest text-faint uppercase"
 				>
-					Channel
+					Library
 				</div>
 				<div class="w-4 shrink-0"></div>
 				<div class="flex w-16 shrink-0 flex-col items-center gap-1">
@@ -174,18 +201,74 @@
 						</div>
 					</div>
 				{/each}
+				{#each data.links as link (link.id)}
+					<!-- Federated servers: one more principal you share with. Per-channel checkboxes in
+					     the rows; the whole-library toggle lives on each library's section header. -->
+					<div class="flex w-20 shrink-0 flex-col items-center gap-1">
+						<span
+							class="max-w-full truncate font-mono text-[11px] text-sky-300"
+							title="Federated server “{link.name}” — sharing is allow-list: nothing is shared until ticked"
+							>⇄ {link.name}</span
+						>
+						<span class="font-mono text-[9px] tracking-wider text-faint uppercase">server</span>
+					</div>
+				{/each}
 			</div>
 
-			{#each data.channels as ch (ch.id)}
-				{#key version}
-					<ChannelVisibilityRow
-						channel={ch}
-						users={data.users}
-						hidden={!passes(ch)}
-						focusUserId={focusUser}
-						onPrivateChange={(p) => (privateById[ch.id] = p)}
-					/>
-				{/key}
+			{#each groups as g (g.id ?? 'none')}
+				<div class="flex items-center gap-2 border-b border-line-soft bg-base-300/40 py-1.5">
+					<button
+						onclick={() => (open[String(g.id)] = !isOpen(g.id))}
+						class="flex min-w-[9rem] flex-1 items-center gap-1.5 text-left font-mono text-[10px] font-semibold tracking-widest text-faint uppercase transition-colors hover:text-base-content"
+						title={isOpen(g.id) ? 'Collapse this library' : 'Expand for per-channel control'}
+					>
+						<span class="w-3 text-center">{isOpen(g.id) ? '▾' : '▸'}</span>
+						{g.name}
+						<span class="font-normal tracking-normal text-faint normal-case">· {g.channels.length}</span>
+					</button>
+					<div class="w-4 shrink-0"></div>
+					<div class="w-16 shrink-0"></div>
+					{#each data.users as u (u.id)}
+						<div class="w-20 shrink-0" class:hidden={focusUser !== null && focusUser !== u.id}></div>
+					{/each}
+					{#each data.links as link (link.id)}
+						<div class="flex w-20 shrink-0 justify-center">
+							{#if g.id != null}
+								{@const whole = link.grantedLibraryIds.includes(g.id)}
+								<form
+									method="POST"
+									action="?/setFedLibraryGrant"
+									use:enhance={afterBulk(
+										whole
+											? `Stopped sharing the whole ${g.name} library with ${link.name}.`
+											: `Sharing the whole ${g.name} library (current + future) with ${link.name}.`
+									)}
+								>
+									<input type="hidden" name="linkId" value={link.id} />
+									<input type="hidden" name="libraryId" value={g.id} />
+									<input type="hidden" name="on" value={whole ? '0' : '1'} />
+									<button
+										class="{miniBtn} {whole ? 'border-sky-400/60 text-sky-300' : ''}"
+										title="Share the WHOLE {g.name} library with {link.name} — everything in it now and in the future"
+										>{whole ? 'whole ✓' : 'whole'}</button
+									>
+								</form>
+							{/if}
+						</div>
+					{/each}
+				</div>
+				{#each g.channels as ch (ch.id)}
+					{#key version}
+						<ChannelVisibilityRow
+							channel={ch}
+							users={data.users}
+							links={data.links}
+							hidden={!passes(ch) || !isOpen(g.id)}
+							focusUserId={focusUser}
+							onPrivateChange={(p) => (privateById[ch.id] = p)}
+						/>
+					{/key}
+				{/each}
 			{/each}
 			{#if !anyShown}
 				<p class="py-6 font-mono text-sm text-muted">No channels match.</p>

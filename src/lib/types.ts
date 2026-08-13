@@ -63,6 +63,10 @@ export interface VideoDetail {
 	title: string;
 	channel_id: string;
 	channel_name: string;
+	/** Federation: the owning peer's namespace prefix; NULL/undefined = local. Informational for
+	 *  clients (a "from Bob's server" badge); the playback descriptor already carries the absolute
+	 *  peer URLs, so no client logic branches on this. */
+	peer_id?: string | null;
 	description: string | null;
 	upload_date: string | null;
 	timestamp: number | null;

@@ -4,6 +4,7 @@ import { canSeeChannel } from '$lib/server/visibility';
 import { getWatch, watchedAtSeconds, resumePosition } from '$lib/server/watch';
 import { hlsEnabled } from '$lib/server/hls';
 import { getUserPrefs, DEFAULT_PREFS } from '$lib/server/prefs';
+import { fedPlaybackUrls } from '$lib/server/fedclient';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
@@ -15,9 +16,27 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	// Indexed (video_tags) so it's ~0.2ms — cheap to load in SSR, which lets the page place
 	// it under the video on mobile and in the sidebar on desktop from a single source.
 	const related = locals.user ? relatedVideos(params.id, locals.user.id, 8) : [];
+
+	// FEDERATED video: media streams DIRECT from the peer — fetch absolute peer-signed URLs for the
+	// player (contract §Federation). Peer down → the page still renders (metadata + related are
+	// local); the player slot shows an explicit "peer unreachable" card instead of a fake error.
+	const remote = video.peer_id != null;
+	let srcUrl: string | null = null;
+	let fedHlsUrl: string | null = null;
+	let peerUnavailable = false;
+	if (remote) {
+		try {
+			const abs = await fedPlaybackUrls(video.id);
+			srcUrl = abs.url;
+			fedHlsUrl = abs.hlsUrl;
+		} catch {
+			peerUnavailable = true;
+		}
+	}
+
 	// Whether on-the-fly HLS is available — the player's ONLY fallback on a decode failure (the
-	// whole-file compat tier was removed 2026-08-07).
-	const hls = hlsEnabled();
+	// whole-file compat tier was removed 2026-08-07). For a federated video that's the PEER's HLS.
+	const hls = remote ? fedHlsUrl != null : hlsEnabled();
 	// Some sources play VIDEO but silently drop AUDIO on the web <video> with no MediaError, so fail-open
 	// can't catch them — a Matroska container OR a Chrome-undecodable audio codec (AC-3/E-AC-3/DTS/TrueHD).
 	// For those the player must START on live HLS rather than attempt the original (see webPrefersCompat).
@@ -31,6 +50,10 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		related,
 		preferCompat,
 		hlsEnabled: hls,
+		srcUrl,
+		hlsUrl: fedHlsUrl,
+		remote,
+		peerUnavailable,
 		watchedAt: watchedAtSeconds(video.duration),
 		resumePosition: resumePosition(watch, video.duration),
 		prefs: locals.user ? getUserPrefs(locals.user.id) : DEFAULT_PREFS

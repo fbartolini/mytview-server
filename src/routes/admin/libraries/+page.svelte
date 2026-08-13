@@ -63,10 +63,15 @@
 		showInRecent = true;
 		browsing = false;
 	}
+	// Virtual (federation mapping target) being edited → path/format controls render disabled.
+	const editingVirtual = $derived(
+		editId != null && (data.libraries.find((l) => l.id === editId)?.virtual ?? false)
+	);
+
 	function startEdit(l: Lib) {
 		editId = l.id;
 		name = l.name;
-		path = l.path;
+		path = l.path ?? ''; // virtual (federation) libraries have no folder; the field renders disabled
 		format = l.format;
 		newPrivate = l.newPrivate;
 		showInRecent = l.showInRecent;
@@ -204,7 +209,13 @@
 				<div class="flex items-center gap-2">
 					<span class="truncate font-medium text-base-content">{l.name}</span>
 					<span class="rounded px-1.5 py-0.5 font-mono text-[10px] {fmtBadge(l.format)}">{l.format}</span>
-					{#if !l.exists}
+					{#if l.virtual}
+						<span
+							class="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] text-sky-300"
+							title="A federation mapping target — no local folder; content syncs from a peer server"
+							>federated</span
+						>
+					{:else if !l.exists}
 						<span
 							class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300"
 							title="This folder wasn't found under the media root">missing</span
@@ -212,7 +223,7 @@
 					{/if}
 				</div>
 				<div class="mt-0.5 font-mono text-xs text-muted">
-					/media/{l.path} · new items {l.newPrivate ? 'private' : 'public'}{l.showInRecent ? '' : ' · not in Recent'}
+					{l.virtual ? 'no local folder (federated)' : `/media/${l.path}`} · new items {l.newPrivate ? 'private' : 'public'}{l.showInRecent ? '' : ' · not in Recent'}
 				</div>
 			</div>
 			<button
@@ -249,21 +260,31 @@
 		</label>
 		<label class="block">
 			<span class="mb-1 block text-xs text-muted">Format</span>
-			<select class={input} name="format" bind:value={format}>
+			<!-- A virtual's format is inherited from the federated source and locked (the server
+			     ignores/rejects changes; the disabled control just says so up front). -->
+			<select class={input} name="format" bind:value={format} disabled={editingVirtual}>
 				<option value="channels">channels — videos + .info.json</option>
 				<option value="series">series — TV shows (.nfo + seasons)</option>
 				<option value="movies">movies — films (movie.nfo + posters)</option>
 			</select>
+			{#if editingVirtual}<input type="hidden" name="format" value={format} />{/if}
 		</label>
 	</div>
 
 	<div class="mt-3">
 		<span class="mb-1 block text-xs text-muted">Folder</span>
 		<div class="flex gap-2">
-			<input class={input} name="path" bind:value={path} placeholder="(media root)" />
+			<input
+				class={input}
+				name="path"
+				bind:value={path}
+				placeholder={editingVirtual ? 'no local folder (federated)' : '(media root)'}
+				disabled={editingVirtual}
+			/>
 			<button
 				type="button"
-				class="whitespace-nowrap rounded border border-line px-3 text-sm text-muted transition-colors hover:border-primary/60 hover:text-base-content"
+				disabled={editingVirtual}
+				class="whitespace-nowrap rounded border border-line px-3 text-sm text-muted transition-colors hover:border-primary/60 hover:text-base-content disabled:pointer-events-none disabled:opacity-40"
 				onclick={openBrowser}>Browse…</button
 			>
 		</div>

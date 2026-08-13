@@ -104,6 +104,28 @@ export const SCAN_INTERVAL_MIN = (() => {
 	return Number.isFinite(n) && n >= 0 ? n : 5;
 })();
 
+// --- Federation (docs/federation-design.md) -----------------------------------------------------
+// The public base URL THIS server should be reached at by peers' clients (scheme://host[:port], no
+// trailing slash). Only needed to SHARE (it's embedded in pairing invites); unset → invites capture
+// the request's externalOrigin (x-forwarded-aware) instead. Consuming needs no self-URL.
+// (Named EXTERNAL_URL, not PUBLIC_URL — SvelteKit reserves the PUBLIC_ env prefix for client-side vars.)
+export const EXTERNAL_URL: string | null = env.EXTERNAL_URL?.trim()
+	? env.EXTERNAL_URL.trim().replace(/\/+$/, '')
+	: null;
+
+// ORIGIN is consumed by SvelteKit itself (url.origin becomes exactly this). We only READ it as a
+// federation trust signal: with ORIGIN set, the request-derived address is authoritative — no need
+// to warn the owner about a possibly-fabricated https:// scheme.
+export const ORIGIN_SET: boolean = !!env.ORIGIN?.trim();
+
+// Disk cache for federated artwork — NOT an env var: it nests under the image cache the server
+// already keeps (`IMAGE_CACHE_DIR/fed`), falling back to an OS temp dir when the cache is off
+// (fed art has no local original, so it must live somewhere). Sync cadence + the public address
+// are OWNER SETTINGS on /admin/federation (app_meta), not env — compose stays clean.
+export const FED_ART_DIR = IMAGE_CACHE_DIR
+	? join(IMAGE_CACHE_DIR, 'fed')
+	: join(tmpdir(), 'mytview-fedart');
+
 // Who may create accounts. Login is always allowed.
 //   'invite' (default): first account bootstraps the owner; after that a single-use
 //                       invite token is required. Works the same on LAN or WAN.

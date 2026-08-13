@@ -36,7 +36,9 @@ export interface Library {
 interface LibraryRow {
 	id: number;
 	name: string;
-	path: string;
+	/** MEDIA_ROOT-relative subfolder; '' = the root itself; NULL = VIRTUAL (a federation mapping
+	 *  target with no local folder — never walked; see docs/federation-design.md). */
+	path: string | null;
 	format: string;
 	new_private: number;
 	show_in_recent: number;
@@ -67,6 +69,7 @@ export function resolveLibraries(): Library[] {
 		.all() as LibraryRow[];
 	const libs: Library[] = [];
 	for (const r of rows) {
+		if (r.path == null) continue; // virtual (federation mapping target) — nothing local to walk
 		const root = rootFor(r.path);
 		if (!root) continue; // path escaped MEDIA_ROOT (validated on add, but defence in depth)
 		libs.push({
@@ -86,12 +89,16 @@ export function resolveLibraries(): Library[] {
 export interface LibraryConfig {
 	id: number;
 	name: string;
-	path: string;
+	/** NULL = virtual (federation mapping target, no local folder). */
+	path: string | null;
 	format: LibraryFormat;
 	newPrivate: boolean;
 	/** false = this library's items stay OUT of the Recent feed (a browse-deliberately collection).
 	 *  Feed-only — search, tag/genre browsing, and the library page itself are untouched. */
 	showInRecent: boolean;
+	/** True for a federation virtual: exists purely to receive mapped peer content. Path/format are
+	 *  not owner-editable (format is inherited from the federated source). */
+	virtual: boolean;
 }
 
 const toConfig = (r: LibraryRow): LibraryConfig => ({
@@ -100,7 +107,8 @@ const toConfig = (r: LibraryRow): LibraryConfig => ({
 	path: r.path,
 	format: asFormat(r.format),
 	newPrivate: !!r.new_private,
-	showInRecent: !!r.show_in_recent
+	showInRecent: !!r.show_in_recent,
+	virtual: r.path == null
 });
 
 export function listLibraries(): LibraryConfig[] {
@@ -139,8 +147,10 @@ export function normalizeLibraryPath(input: string): string | null {
 	return abs ? path.relative(MEDIA_ROOT, abs) : null;
 }
 
-/** Does the library's folder actually exist on disk? (Surface a warning in the UI, don't block.) */
-export function libraryFolderExists(relPath: string): boolean {
+/** Does the library's folder actually exist on disk? (Surface a warning in the UI, don't block.)
+ *  Virtuals (path NULL) have no folder by design — always "fine". */
+export function libraryFolderExists(relPath: string | null): boolean {
+	if (relPath == null) return true;
 	const abs = rootFor(relPath);
 	return !!abs && isDir(abs);
 }
@@ -168,6 +178,25 @@ export function addLibrary(
 		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, showInRecent ? 1 : 0, now);
 }
 
+/** Create a VIRTUAL library — a federation mapping target with no local folder (path NULL). Its
+ *  format is inherited from the federated source and locked (updateLibrary refuses to change it).
+ *  Returns the new library id. */
+export function addVirtualLibrary(name: string, format: LibraryFormat, now = Date.now()): number {
+	const res = stateDb()
+		.prepare(
+			'INSERT INTO libraries (name, path, format, new_private, show_in_recent, created_at, sort_order) ' +
+				'VALUES (?, NULL, ?, 0, 1, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM libraries))'
+		)
+		.run(name.trim(), format, now);
+	return Number(res.lastInsertRowid);
+}
+
+/** Is this library the target of any federation mapping? (Its format is then locked — mirrored
+ *  rows of that format live under it.) */
+export function isMappingTarget(id: number): boolean {
+	return !!stateDb().prepare('SELECT 1 FROM fed_library_map WHERE local_library_id = ? LIMIT 1').get(id);
+}
+
 export function updateLibrary(
 	id: number,
 	name: string,
@@ -176,6 +205,21 @@ export function updateLibrary(
 	newPrivate: boolean,
 	showInRecent = true
 ): void {
+	const cur = getLibrary(id);
+	if (!cur) return;
+	// Virtuals have no folder and an inherited format: only the presentational fields are editable
+	// (the admin UI disables the others; ignoring, not failing, keeps the shared form action simple).
+	if (cur.virtual) {
+		stateDb()
+			.prepare('UPDATE libraries SET name = ?, new_private = ?, show_in_recent = ? WHERE id = ?')
+			.run(name.trim(), newPrivate ? 1 : 0, showInRecent ? 1 : 0, id);
+		return;
+	}
+	// A federation mapping target holds mirrored rows of its format — changing it would orphan them
+	// (and break the movies-merge invariant). Surfaced to the admin form as a fail(400).
+	if (format !== cur.format && isMappingTarget(id)) {
+		throw new Error('format-locked: this library receives federated content of its current format');
+	}
 	stateDb()
 		.prepare('UPDATE libraries SET name = ?, path = ?, format = ?, new_private = ?, show_in_recent = ? WHERE id = ?')
 		.run(name.trim(), relPath, format, newPrivate ? 1 : 0, showInRecent ? 1 : 0, id);

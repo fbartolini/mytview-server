@@ -5,12 +5,22 @@
 	let {
 		channel,
 		users,
+		links = [],
 		hidden = false,
 		focusUserId = null,
 		onPrivateChange
 	}: {
-		channel: { id: string; name: string; private: boolean; grantedUserIds: number[] };
+		channel: {
+			id: string;
+			name: string;
+			library_id?: number | null;
+			private: boolean;
+			grantedUserIds: number[];
+		};
 		users: { id: number; username: string }[];
+		/** Federated servers as additional share principals (allow-list, independent of `private`).
+		 *  A whole-library grant renders the box checked+locked — the library header controls it. */
+		links?: { id: number; name: string; grantedChannelIds: string[]; grantedLibraryIds: number[] }[];
 		hidden?: boolean;
 		focusUserId?: number | null;
 		onPrivateChange?: (isPrivate: boolean) => void;
@@ -20,6 +30,9 @@
 	// owns its state; the page bumps a key to remount + re-seed after a bulk action).
 	let priv = $state(untrack(() => channel.private));
 	let grantedIds = $state<number[]>(untrack(() => [...channel.grantedUserIds]));
+	let fedIds = $state<number[]>(
+		untrack(() => links.filter((l) => l.grantedChannelIds.includes(channel.id)).map((l) => l.id))
+	);
 	let status = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
 	let form: HTMLFormElement;
@@ -105,6 +118,35 @@
 				aria-label={u.username}
 				title={priv ? u.username : `${u.username} — only applies to private channels`}
 			/>
+		</div>
+	{/each}
+
+	{#each links as l (l.id)}
+		{@const covered = channel.library_id != null && l.grantedLibraryIds.includes(channel.library_id)}
+		<div class="flex w-20 shrink-0 justify-center">
+			{#if covered}
+				<!-- Whole-library grant covers it: locked on (no name → never submitted; the library
+				     header's "whole" toggle is the control). -->
+				<input
+					type="checkbox"
+					checked
+					disabled
+					class="accent-sky-400 opacity-60"
+					aria-label="{l.name} (whole library shared)"
+					title="Shared via the whole-library grant — use the library row to change"
+				/>
+			{:else}
+				<input
+					type="checkbox"
+					name="fedgrant"
+					value={l.id}
+					bind:group={fedIds}
+					onchange={scheduleSave}
+					class="accent-sky-400"
+					aria-label={l.name}
+					title="Share “{channel.name}” with {l.name}'s server"
+				/>
+			{/if}
 		</div>
 	{/each}
 </form>

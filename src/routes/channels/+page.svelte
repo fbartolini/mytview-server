@@ -23,6 +23,15 @@
 		genre ? data.channels.filter((c) => c.genres?.includes(genre!)) : data.channels
 	);
 
+	// Show/hide fully-watched channels, preserving ?library/?sort — the same "show watched" toggle
+	// the channel detail page has (default hides finished shows; ?watched=1 reveals them).
+	const watchedHref = $derived.by(() => {
+		const url = new URL(page.url);
+		if (data.showWatched) url.searchParams.delete('watched');
+		else url.searchParams.set('watched', '1');
+		return url.pathname + url.search;
+	});
+
 	// Re-sort in place, preserving ?library. 'name' is the default → drop the param to keep URLs clean.
 	function setSort(e: Event) {
 		const value = (e.currentTarget as HTMLSelectElement).value;
@@ -37,7 +46,12 @@
 
 <div class="mb-5 flex items-baseline gap-3">
 	<h1 class="text-xl font-bold capitalize tracking-tight">{heading}</h1>
-	<span class="font-mono text-xs text-faint">{data.channels.length} {data.library ? noun : 'total'}</span>
+	<span class="font-mono text-xs text-faint"
+		>{data.channels.length}
+		{data.library ? noun : 'total'}{data.hiddenWatched > 0
+			? ` · ${data.hiddenWatched} watched hidden`
+			: ''}</span
+	>
 	<select
 		aria-label="Sort"
 		value={data.sort}
@@ -48,10 +62,21 @@
 		<option value="updated">Recently updated</option>
 		<option value="unwatched">Most unwatched</option>
 	</select>
+	<a href={watchedHref} class="font-mono text-xs text-muted hover:text-base-content">
+		{data.showWatched ? '× hide watched' : 'show watched'}
+	</a>
 </div>
 
 {#if data.channels.length === 0}
-	{#if data.library}
+	{#if data.hiddenWatched > 0}
+		<!-- Not empty — everything here is watched. Same shape as the channel page's all-watched card. -->
+		<div
+			class="rounded-xl border border-dashed border-line p-10 text-center font-mono text-sm text-muted"
+		>
+			You’ve watched everything {data.library ? `in ${data.library.name}` : 'here'}.
+			<a href={watchedHref} class="text-primary hover:underline">show watched</a>
+		</div>
+	{:else if data.library}
 		<div
 			class="rounded-xl border border-dashed border-line p-10 text-center font-mono text-sm text-muted"
 		>
