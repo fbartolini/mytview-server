@@ -280,14 +280,17 @@
 			</div>
 			<div class="border-t border-line-soft"></div>
 
+			<!-- Personal first, then ONE owner entry. The per-page admin links used to live here and the
+			     menu grew with every feature (federation + plex in one week); they now sit on the /admin
+			     hub, which is where new admin surfaces go — the menu stays this length. Devices is
+			     reachable from Account, which already links it. -->
 			{@render menulink('/account', 'Account')}
-			{@render menulink('/shares', 'Share links')}
-			{@render menulink('/sessions', 'Devices')}
+			{@render menulink('/shares', 'Public links')}
 			{#if data.canInvite}{@render menulink('/invite', 'Invite someone')}{/if}
-			{#if data.isOwner}{@render menulink('/admin/libraries', 'Libraries')}{/if}
-			{#if data.isOwner}{@render menulink('/admin/visibility', 'Sharing')}{/if}
-			{#if data.isOwner}{@render menulink('/admin/users', 'Users')}{/if}
-			{#if data.isOwner}{@render menulink('/admin/federation', 'Federation')}{/if}
+			{#if data.isOwner}
+				<div class="border-t border-line-soft"></div>
+				{@render menulink('/admin', 'Server')}
+			{/if}
 
 			<div class="border-t border-line-soft"></div>
 			<button
@@ -300,19 +303,6 @@
 				class="block w-full px-3.5 py-2 text-left font-mono text-xs text-muted hover:bg-base-300 hover:text-base-content disabled:opacity-50"
 				>{scanning ? 'Scanning…' : 'Rescan library'}</button
 			>
-			{#if data.isOwner}
-				<button
-					role="menuitem"
-					onclick={() => {
-						menuOpen = false;
-						rescan(true);
-					}}
-					disabled={scanning}
-					title="Re-parse every video (ignores mtime) — fixes stale thumbnails or metadata. Slower."
-					class="block w-full px-3.5 py-2 text-left font-mono text-xs text-muted hover:bg-base-300 hover:text-base-content disabled:opacity-50"
-					>{scanning ? 'Scanning…' : 'Full rescan'}</button
-				>
-			{/if}
 
 			<div class="border-t border-line-soft"></div>
 			<form method="POST" action="/logout">

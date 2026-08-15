@@ -29,10 +29,10 @@
 	}
 </script>
 
-<svelte:head><title>Share links · MytView</title></svelte:head>
+<svelte:head><title>Public links · MytView</title></svelte:head>
 
 <div class="mb-5 flex items-baseline gap-3">
-	<h1 class="text-xl font-bold tracking-tight">Share links</h1>
+	<h1 class="text-xl font-bold tracking-tight">Public links</h1>
 	<span class="font-mono text-xs text-faint">{data.shares.length} active</span>
 </div>
 

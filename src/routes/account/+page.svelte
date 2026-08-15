@@ -221,8 +221,16 @@
 		{/if}
 	{/if}
 
-	<p class="mt-4 font-mono text-xs text-muted">
-		Manage your signed-in devices on
-		<a href="/sessions" class="text-base-content underline hover:text-primary">Devices</a>.
-	</p>
+	<h2 class="mt-8 mb-2 font-mono text-[11px] font-semibold tracking-widest text-faint uppercase">
+		Devices
+	</h2>
+	<a
+		href="/sessions"
+		class="block rounded-xl border border-line bg-base-200 p-5 transition-colors hover:border-primary/50"
+	>
+		<span class="font-medium">Signed-in devices</span>
+		<span class="mt-0.5 block text-[13px] text-muted">
+			See every phone, TV, and browser signed into your account — and sign any of them out.
+		</span>
+	</a>
 </div>

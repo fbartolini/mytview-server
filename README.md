@@ -137,6 +137,13 @@ page; each user links their own Plex account there via plex.tv/link.
 The web UI ships with the server. The native apps (iPhone/iPad/Apple TV, Google TV,
 Samsung TV) are separate, closed-source products by the same author — the Samsung app is free.
 
+**Try the app betas** — the apps are in pre-release while store review wraps up; join directly:
+
+- **iPhone / iPad / Apple TV**: [join via TestFlight](https://testflight.apple.com/join/CsBAkfb9)
+- **Google TV / Android**: open testing is in review at Google — the join link appears here as soon as it's approved.
+- **Samsung TV**: the app is free and lands on the Samsung store when review completes — no beta
+  channel; [watch releases](https://github.com/fbartolini/mytview-server/releases) for the announcement.
+
 Third-party clients are welcome: the full client contract — auth and device pairing, the
 video/playback descriptors, watch-state rules, and the capabilities negotiation — is documented
 in [`docs/api.md`](docs/api.md). `GET /api/v1/status` advertises `serverVersion` and a
