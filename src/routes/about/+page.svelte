@@ -20,14 +20,27 @@
 			no ads, and it never modifies your files.
 		</p>
 		<p class="mt-3 text-[13px] leading-relaxed text-muted">
-			If it's useful to you, you can
-			<a
-				href="https://buymeacoffee.com/fbartolini"
-				target="_blank"
-				rel="noopener"
-				class="text-primary underline">buy me a coffee</a
-			> — entirely optional, and it unlocks nothing: the software is the same either way.
+			If it's useful to you, you can buy me a coffee — entirely optional, and it unlocks nothing:
+			the software is the same either way.
 		</p>
+		<!-- Buy Me a Coffee's OWN button is a third-party <script> from their CDN. We render it
+		     locally instead (same brand yellow #FFDD00, black text, cup): no outbound request on
+		     page view — which would contradict this product's "no cloud, no analytics" promise and
+		     hand every visitor's IP to a CDN — and it still renders on a LAN server with no
+		     internet access, where the remote script would silently show nothing. -->
+		<a
+			href="https://buymeacoffee.com/fbartolini"
+			target="_blank"
+			rel="noopener"
+			class="mt-3 inline-flex items-center gap-2 rounded-lg border border-black/10 bg-[#FFDD00] px-4 py-2 text-[15px] font-semibold text-black shadow-sm transition-transform hover:scale-[1.03]"
+		>
+			<svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8">
+				<path d="M4 8h12v6a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V8Z" stroke-linejoin="round" />
+				<path d="M16 9h2.5a2.5 2.5 0 0 1 0 5H16" stroke-linecap="round" stroke-linejoin="round" />
+				<path d="M7 3.5c0 1-.8 1.3-.8 2.2M10.5 3.5c0 1-.8 1.3-.8 2.2M14 3.5c0 1-.8 1.3-.8 2.2" stroke-linecap="round" />
+			</svg>
+			Buy me a coffee
+		</a>
 		<p class="mt-3 font-mono text-xs text-faint">
 			The server and this web app are free and open source (GPL-3) ·
 			<a href="https://mytview.com" target="_blank" rel="noopener" class="text-muted underline hover:text-base-content">mytview.com</a>
