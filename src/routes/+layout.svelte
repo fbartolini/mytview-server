@@ -285,6 +285,7 @@
 			     hub, which is where new admin surfaces go — the menu stays this length. Devices is
 			     reachable from Account, which already links it. -->
 			{@render menulink('/account', 'Account')}
+			{@render menulink('/about', 'About MytView')}
 			{@render menulink('/shares', 'Public links')}
 			{#if data.canInvite}{@render menulink('/invite', 'Invite someone')}{/if}
 			{#if data.isOwner}
