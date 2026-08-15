@@ -137,6 +137,10 @@ page; each user links their own Plex account there via plex.tv/link.
 The web UI ships with the server. The native apps (iPhone/iPad/Apple TV, Google TV,
 Samsung TV) are separate, closed-source products by the same author — the Samsung app is free.
 
+They're free during the beta and become a small one-time purchase (no subscription) later this
+year. **Install an app before 1 November 2026 and it stays free forever** — a founder licence,
+detected from the install date itself, with nothing to claim or register.
+
 **Try the app betas** — the apps are in pre-release while store review wraps up; join directly:
 
 - **iPhone / iPad / Apple TV**: [join via TestFlight](https://testflight.apple.com/join/CsBAkfb9)
