@@ -66,6 +66,22 @@ CREATE TABLE IF NOT EXISTS video_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_video_tags_tag   ON video_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_video_tags_video ON video_tags(video_id);
+
+-- Subtitle sidecars found NEXT TO the media file (subtitles.ts). Rebuilt by every scan like the
+-- rest of index.db, so it is disposable: delete index.db and it comes back. Nothing here is
+-- fetched or generated — a row exists only because a .srt/.vtt file exists on disk.
+CREATE TABLE IF NOT EXISTS video_subtitles (
+    video_id  TEXT NOT NULL,
+    lang      TEXT,                                  -- 'en', 'pt-BR', … NULL when the name says nothing
+    label     TEXT NOT NULL,                         -- menu text: "English (SDH)"
+    kind      TEXT NOT NULL,                         -- 'captions' (SDH/CC) | 'subtitles'
+    forced    INTEGER NOT NULL DEFAULT 0,
+    sub_path  TEXT NOT NULL,                         -- MEDIA_ROOT-relative
+    ord       INTEGER NOT NULL DEFAULT 0,            -- server-decided display order; clients render as given
+    PRIMARY KEY (video_id, sub_path),
+    FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_video_subs_video ON video_subtitles(video_id);
 `;
 
 function ensureColumn(d: Database.Database, table: string, col: string, decl: string): void {
@@ -86,6 +102,14 @@ export function db(): Database.Database {
 	// rebuild on upgrade; each call is a no-op once the column exists.
 	ensureColumn(d, 'channels', 'kind', "TEXT NOT NULL DEFAULT 'channel'");
 	ensureColumn(d, 'channels', 'library_id', 'INTEGER'); // no index over it — filtered lists are small
+	// video_subtitles briefly also stored EMBEDDED tracks, cached against the media file's mtime.
+	// That design is gone (subsembed.ts asks the container at playback time instead), and the rows it
+	// left behind are worse than useless: a file marked "probed" whose rows a scan had wiped would
+	// never be looked at again, so its subtitles stayed invisible for good. The columns are kept so
+	// an older db still opens; the stale rows are dropped once, here.
+	ensureColumn(d, 'video_subtitles', 'stream_index', 'INTEGER');
+	ensureColumn(d, 'videos', 'subs_probed', 'INTEGER');
+	d.exec('DELETE FROM video_subtitles WHERE stream_index IS NOT NULL');
 	ensureColumn(d, 'videos', 'season_number', 'INTEGER');
 	ensureColumn(d, 'videos', 'episode_number', 'INTEGER');
 	ensureColumn(d, 'videos', 'year', 'INTEGER');

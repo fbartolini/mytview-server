@@ -1,5 +1,7 @@
 # MytView Server
 
+> *Say it "mighty view" — and the first four letters are **MyTV**.*
+
 **A clean, fast, read-only viewer for a self-hosted video library** — video files plus their
 metadata sidecars (`.info.json`, or Kodi/Emby-style `.nfo` for TV series and movies) — with
 multi-user accounts, per-user watch state, owner-controlled per-channel privacy, public share
@@ -16,6 +18,7 @@ this server over its [documented API](docs/api.md).
 - 🔦 **Per-channel privacy** — mark channels public or private and grant private ones to specific people, from a per-user × per-channel grid.
 - 📺 **Channels, series, and movies** — creator-channel libraries (`.info.json` sidecars), TV-series libraries (`.nfo` + `S01E02` naming, season/episode ordering, next-episode tracking), and movie libraries (Radarr/Kodi layout, a 2:3 poster wall with genre filters and sort). Libraries are configured in the UI, not env vars; fully-watched shows tidy themselves out of the grids until something new arrives.
 - 🎞️ **Direct-play first, live HLS fallback** — every client tries the original file first; when it can't decode it, the server live-transcodes an ephemeral HLS stream that starts in seconds (VAAPI hardware encode when available, CPU fallback). Nothing is pre-transcoded or stored long-term.
+- 💬 **Subtitles & captions** — picked up from `.srt`/`.vtt` files next to the video *or* from text tracks inside the `.mkv`/`.mp4` itself, with SDH/CC marked as captions. Nothing is downloaded: what's on disk is what you get. **Image-based subtitles (PGS/VobSub) are not supported** — they're pictures of text and would need OCR or a burned-in re-encode; use a text (SRT) version instead.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
 - 🌐 **Federation** — peer with **any number** of other MytView servers, sharing and consuming in both directions. Share different channels, shows, or whole libraries with each household; everything you consume merges into your own libraries (browse, search, and watch state stay on *your* server) while video streams flow **directly** from whichever server holds the file — plus per-peer concurrent-stream caps and consumption stats for the sharer.
 - 🔄 **Plex sync** — two-way watched-state and resume-point sync with a Plex server on the same library. Each user links their own Plex account (plex.tv PIN flow); years of existing Plex history import on the first sync, and an unwatch in either app propagates to the other.
@@ -71,6 +74,8 @@ that, signup requires a single-use invite (from `/invite`) unless `ALLOW_SIGNUP=
 | `ORIGIN` | — | Your external URL — set **only** behind a reverse proxy / TLS. |
 | `ADDRESS_HEADER` | — | Behind a proxy/CDN, the header carrying the real client IP (e.g. `x-forwarded-for`), so login rate limits see clients rather than the proxy. |
 | `TRANSCODE_HWACCEL` | `0` | `1` = Intel VAAPI hardware encode for live HLS (needs `/dev/dri` passthrough; amd64). Falls back to CPU automatically. |
+| `EMBEDDED_SUBS` | `1` | `off` stops the server reading subtitle tracks out of `.mkv`/`.mp4` containers (sidecar `.srt`/`.vtt` files still work). Extraction reads the whole container once per file, so on slow network storage turning it off is a reasonable choice. |
+| `SUBS_CACHE_DIR` | `/transcodes/subcache` | Where extracted subtitle text is cached, so a container is only ever read once. `off` = memory only. |
 | `HLS_DIR` | `/transcodes/hls` | Where live-HLS session segments are written. `off` disables live transcoding (direct-play only). |
 | `SCAN_INTERVAL` | `5` | Auto-rescan interval in minutes (`0` disables). Incremental and cheap. |
 | `EXTERNAL_URL` | — | The public address federation invites embed — needed only to **share** via federation and only when the auto-detected address is wrong (e.g. a bare `ip:port` server without TLS). |
@@ -141,12 +146,15 @@ They're free during the beta and become a small one-time purchase (no subscripti
 year. **Install an app before 1 November 2026 and it stays free forever** — a founder licence,
 detected from the install date itself, with nothing to claim or register.
 
-**Try the app betas** — the apps are in pre-release while store review wraps up; join directly:
+**Get the apps** — stores approve per device class, so availability differs by platform right now:
 
-- **iPhone / iPad / Apple TV**: [join via TestFlight](https://testflight.apple.com/join/CsBAkfb9)
-- **Google TV / Android**: open testing is in review at Google — the join link appears here as soon as it's approved.
-- **Samsung TV**: the app is free and lands on the Samsung store when review completes — no beta
-  channel; [watch releases](https://github.com/fbartolini/mytview-server/releases) for the announcement.
+- **Apple TV**: [on the App Store](https://apps.apple.com/app/id6790113115)
+- **iPhone / iPad**: in the last stage of App Store review — [join via TestFlight](https://testflight.apple.com/join/CsBAkfb9) meanwhile
+- **Android phone / tablet**: [open beta on Google Play](https://play.google.com/store/apps/details?id=com.mytview.app) —
+  anyone can install it, no invite needed
+- **Google TV**: built and working; Google reviews TV apps as a separate form factor, so it follows shortly
+- **Samsung TV**: free for everyone, lands on the Samsung store when review completes —
+  [watch releases](https://github.com/fbartolini/mytview-server/releases) for the announcement
 
 Third-party clients are welcome: the full client contract — auth and device pairing, the
 video/playback descriptors, watch-state rules, and the capabilities negotiation — is documented

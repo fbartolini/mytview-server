@@ -70,7 +70,10 @@ export const handle: Handle = async ({ event, resolve }) => {
 	let shareOk = pathname.startsWith('/s/');
 	if (!shareOk) {
 		const tok = event.url.searchParams.get('s');
-		const m = tok ? pathname.match(/^\/(media|thumb)\/([^/]+)$/) : null;
+		// A subtitle track is part of the shared video (/subs/<videoId>/<n>) — it rides the SAME grant
+		// as the stream, cookie-gated cap included, and is normalised to the 'media' rule below.
+		const sub = tok ? pathname.match(/^\/subs\/([^/]+)\/\d+$/) : null;
+		const m = sub ? ['', 'media', sub[1]] : tok ? pathname.match(/^\/(media|thumb)\/([^/]+)$/) : null;
 		if (tok && m) {
 			let id: string | null = null;
 			try {
@@ -97,7 +100,12 @@ export const handle: Handle = async ({ event, resolve }) => {
 	// there's no session (a logged-in request is already authorized) and no share token matched.
 	let signedOk = false;
 	if (!event.locals.user && !shareOk && event.url.searchParams.has('k')) {
-		const m = pathname.match(/^\/(media|thumb|poster|fanart)\/([^/]+)$/);
+		// Subtitle tracks reuse the video's 'media' signature (one grant covers the video and its
+		// captions — see /api/v1/videos/[id]): /subs/<videoId>/<trackIndex>. Missing from this
+		// exemption until 2026-08-20, which sent a bare native fetch (iOS URLSession — no cookie,
+		// no header; the signature IS the credential) to the login page instead of the VTT.
+		const sub = pathname.match(/^\/subs\/([^/]+)\/\d+$/);
+		const m = pathname.match(/^\/(media|thumb|poster|fanart)\/([^/]+)$/) ?? (sub && ['', 'media', sub[1]]);
 		if (m) {
 			let id: string | null = null;
 			try {
@@ -127,7 +135,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	if (!event.locals.user && !authRoute && !shareOk && !signedOk) {
 		// APIs / media answer 401; page requests get bounced to the login screen.
-		if (pathname.startsWith('/api/') || /^\/(media|thumb|poster|fanart|hls)\//.test(pathname)) {
+		if (pathname.startsWith('/api/') || /^\/(media|thumb|poster|fanart|hls|subs)\//.test(pathname)) {
 			// The media 401 carries CORS too (below) so a federated hls.js reads a real 401, not an
 			// opaque CORS failure, when a signature expires.
 			const headers = /^\/(hls|media)\//.test(pathname)

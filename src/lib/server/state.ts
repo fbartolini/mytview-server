@@ -139,7 +139,10 @@ CREATE TABLE IF NOT EXISTS web_login_codes (
 CREATE TABLE IF NOT EXISTS user_prefs (
     user_id              INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     autoplay_next        INTEGER NOT NULL DEFAULT 1,
-    still_watching_after INTEGER NOT NULL DEFAULT 3
+    still_watching_after INTEGER NOT NULL DEFAULT 3,
+    subtitle_size        TEXT NOT NULL DEFAULT 'medium',   -- small | medium | large
+    subtitle_color       TEXT NOT NULL DEFAULT 'white',    -- white | yellow
+    browse_prefs         TEXT                              -- JSON { libraryId: { sort?, genre? } }; NULL = none
 );
 
 -- Owner-generated single-use password-reset links (we track no email, so an owner hands the user a
@@ -323,6 +326,13 @@ export function stateDb(): Database.Database {
 	// browse deliberately (movies archive) rather than a feed. Gates ONLY the feed (queries.listVideos);
 	// search/tags/library pages are untouched. Default 1 = current behavior.
 	addColumnIfMissing(d, 'libraries', 'show_in_recent', 'INTEGER NOT NULL DEFAULT 1');
+	// Caption appearance (prefs.ts). Server-owned so someone who needs larger captions sets it once,
+	// not once per device. Nullable + validated on read: rows written before these existed hold NULL.
+	addColumnIfMissing(d, 'user_prefs', 'subtitle_size', "TEXT NOT NULL DEFAULT 'medium'");
+	addColumnIfMissing(d, 'user_prefs', 'subtitle_color', "TEXT NOT NULL DEFAULT 'white'");
+	// Per-library browse state (prefs.ts): JSON map libraryId → { sort?, genre? }. Server-owned so a
+	// sort/filter chosen on one device is how that library opens everywhere. NULL = no saved state.
+	addColumnIfMissing(d, 'user_prefs', 'browse_prefs', 'TEXT');
 	// Owner-defined library display order (/admin/libraries ↑↓). Backfill pre-existing rows with their
 	// id (== the old resolveLibraries order) so a migrated deploy keeps its scan order; the previously
 	// name-sorted nav simply becomes explicit. Idempotent — only NULLs are touched.

@@ -14,6 +14,13 @@ import pkg from '../../../package.json';
 // build they're talking to — the version-negotiation anchor alongside `capabilities`.
 export const SERVER_VERSION: string = pkg.version;
 
+// Build identity, baked in by the Docker build (see Dockerfile). SERVER_VERSION alone can't answer
+// "am I running the build I just deployed?" — it moves a few times a year, while deploys happen
+// daily. `null` on a dev/`node build` run, where the question doesn't arise.
+export const BUILD_SHA: string | null =
+	env.MYTVIEW_GIT_SHA && env.MYTVIEW_GIT_SHA !== 'dev' ? env.MYTVIEW_GIT_SHA.slice(0, 7) : null;
+export const BUILD_TIME: string | null = env.MYTVIEW_BUILD_TIME?.trim() || null;
+
 function bool(value: string | undefined, fallback: boolean): boolean {
 	if (value == null) return fallback;
 	return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
@@ -95,6 +102,31 @@ export const HLS_SESSION_MAX_SEG = int(env.HLS_SESSION_MAX_SEG, 40);
 export const HLS_AHEAD_SEG = Math.max(int(env.HLS_AHEAD_SEG, 30), 4); // ≥4 → a real ahead-buffer + positive throttle hysteresis
 
 // Rescan the library on startup. Cheap (unchanged files are skipped by mtime).
+// Extracted subtitle text, cached on disk. Extraction means ffmpeg reading the WHOLE container to
+// pull one stream out, so it must happen once per file EVER — not once per process, and never twice
+// concurrently. `off` keeps it in memory only (extraction then repeats after a restart).
+export const SUBS_CACHE_DIR =
+	env.SUBS_CACHE_DIR === 'off'
+		? null
+		: env.SUBS_CACHE_DIR
+			? resolve(env.SUBS_CACHE_DIR)
+			: TRANSCODE_DIR
+				? join(TRANSCODE_DIR, 'subcache')
+				: join(tmpdir(), 'mytview-subcache');
+
+// Escape hatch: `EMBEDDED_SUBS=off` stops the server looking inside containers at all (sidecar
+// files still work). For a library on slow storage where an extraction competes with playback,
+// turning this off is a legitimate choice rather than a bug report.
+export const EMBEDDED_SUBS = !/^(0|off|false)$/i.test(env.EMBEDDED_SUBS ?? '1');
+
+// A container carrying MORE than this many embedded text-subtitle streams is served to clients as
+// "start on HLS" (playback.preferHls — contract §playback descriptor). Field-pinned on a 2018 Samsung
+// panel (2026-09-18): a file with 44 interleaved SRT streams stutters and macroblocks in BOTH the
+// HTML5 and the native (AVPlay) engines while every health metric reads perfect — the demuxer chokes,
+// the decoder starves, and nothing fires the error the fail-open ladder waits for. The server is the
+// only party that can decide this (it sees the stream count at descriptor time). 0 = never.
+export const PREFER_HLS_TEXT_STREAMS = Math.max(0, Math.trunc(Number(env.PREFER_HLS_TEXT_STREAMS ?? '8')) || 0);
+
 export const SCAN_ON_START = bool(env.SCAN_ON_START, true);
 
 // Auto-rescan interval in minutes (0 disables). Incremental, so cheap; picks up

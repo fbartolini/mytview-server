@@ -2,7 +2,7 @@ import { error, json } from '@sveltejs/kit';
 import { scanStatus } from '$lib/server/indexer';
 import { libraryCounts } from '$lib/server/queries';
 import { hlsEnabled } from '$lib/server/hls';
-import { SERVER_VERSION } from '$lib/server/config';
+import { BUILD_SHA, SERVER_VERSION } from '$lib/server/config';
 import type { RequestHandler } from './$types';
 
 // Server-owned library/scan state for native clients: lets them tell "still indexing" from "empty"
@@ -29,6 +29,7 @@ export const GET: RequestHandler = ({ locals }) => {
 		// show serverVersion in diagnostics) instead of probing endpoints and guessing from 404s. New
 		// server features append a name here; nothing is ever removed once shipped.
 		serverVersion: SERVER_VERSION,
+		serverBuild: BUILD_SHA, // short commit of the running build; null on a dev run
 		capabilities: ['libraries', 'series', 'movies', 'sessions', 'prefs', 'shares', 'federation', ...(hlsEnabled() ? ['hls'] : [])]
 	});
 };

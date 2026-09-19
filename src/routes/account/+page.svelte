@@ -34,6 +34,50 @@
 	</p>
 
 	<h2 class="mt-8 mb-2 font-mono text-[11px] font-semibold tracking-widest text-faint uppercase">
+		Subtitles
+	</h2>
+	<form
+		method="POST"
+		action="?/subtitlePrefs"
+		use:enhance
+		class="rounded-xl border border-line bg-base-200 p-5"
+	>
+		<p class="text-[13px] text-muted">
+			How captions look when you turn them on. Saved to your account, so it applies on every
+			device you sign in to.
+		</p>
+		<div class="mt-4 flex flex-wrap items-end gap-6">
+			<label class="flex flex-col gap-1.5">
+				<span class="font-mono text-[11px] tracking-wide text-faint uppercase">Size</span>
+				<select
+					name="size"
+					value={data.prefs.subtitleSize}
+					class="rounded-lg border border-line bg-base-100 px-3 py-1.5 text-sm"
+				>
+					<option value="small">Small</option>
+					<option value="medium">Medium</option>
+					<option value="large">Large</option>
+				</select>
+			</label>
+			<label class="flex flex-col gap-1.5">
+				<span class="font-mono text-[11px] tracking-wide text-faint uppercase">Colour</span>
+				<select
+					name="color"
+					value={data.prefs.subtitleColor}
+					class="rounded-lg border border-line bg-base-100 px-3 py-1.5 text-sm"
+				>
+					<option value="white">White</option>
+					<option value="yellow">Yellow</option>
+				</select>
+			</label>
+			<button
+				class="rounded-lg border border-line px-3 py-1.5 text-sm text-muted transition-colors hover:border-primary/60 hover:text-base-content"
+				>Save</button
+			>
+		</div>
+	</form>
+
+	<h2 class="mt-8 mb-2 font-mono text-[11px] font-semibold tracking-widest text-faint uppercase">
 		Change password
 	</h2>
 	<form

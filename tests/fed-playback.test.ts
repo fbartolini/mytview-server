@@ -56,7 +56,7 @@ afterAll(() => {
 });
 
 const PREFIX = captured.serverId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
-const holder = { networkDown: false, urlsCalls: 0, deny: new Set<string>() };
+const holder = { networkDown: false, urlsCalls: 0, deny: new Set<string>(), omitSubtitles: false };
 setFedFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
 	if (holder.networkDown) throw new TypeError('fetch failed');
 	const u = String(input);
@@ -71,7 +71,10 @@ setFedFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
 		return json({
 			url: `/media/${vid}?k=PEERSIG&exp=9999999999`,
 			hlsUrl: `/hls/v/${vid}/index.m3u8?k=PEERSIG&exp=9999999999`,
-			ext: '.mp4'
+			ext: '.mp4',
+			...(holder.omitSubtitles ? {} : { subtitles: [
+				{ lang: 'en', label: 'English (SDH)', kind: 'captions', url: `/subs/${vid}/0?k=PEERSIG&exp=9999999999` }
+			] })
 		});
 	}
 	return json({ error: 'nope' }, 404);
@@ -104,6 +107,19 @@ describe('descriptor for federated videos', () => {
 		expect(body.playback.poster?.startsWith('/thumb/')).toBe(true); // art stays same-origin (design §8)
 		expect(body.playback.compatUrl).toBeNull();
 		expect(body.playback.canTranscode).toBe(false);
+	});
+
+	it('carries the PEER\'s subtitles through, absolute like the media URL', async () => {
+		// A federated video has no local files, so only the peer can resolve its tracks. Without this
+		// the CC control reads "none available" on content the sharing server captions perfectly —
+		// a feature silently falling off at the federation boundary.
+		const d = (await (await detail(`fed:${PREFIX}:a1`)).json()) as {
+			playback: { subtitles: { label: string; url: string; kind: string }[] };
+		};
+		expect(d.playback.subtitles).toHaveLength(1);
+		expect(d.playback.subtitles[0].label).toBe('English (SDH)');
+		expect(d.playback.subtitles[0].kind).toBe('captions');
+		expect(d.playback.subtitles[0].url.startsWith('https://sharer.example/subs/')).toBe(true);
 	});
 
 	it('single-flights + caches the peer round-trip', async () => {

@@ -15,12 +15,46 @@
 
 	// Genre chips (shows): union of the channels' genres (series carry tvshow.nfo <genre>s). Filtering
 	// is CLIENT-side over the already-delivered list — no refetch (⇔ the movies wall's genre chips).
+	// Initial value = this library's SAVED filter; navigating between libraries reuses this component,
+	// so the effect re-applies the TARGET library's state (contract §Browse persistence).
 	let genre = $state<string | null>(null);
+	$effect(() => {
+		genre = data.savedGenre ?? null;
+	});
+
+	// Write-through on every user change (§Browse persistence): the entry replaces this library's
+	// saved sort+genre whole; both at defaults → null clears it. Fire-and-forget — the page already
+	// shows the state, the server just remembers it for the next open, on any device.
+	function persistBrowse(nextSort: string, nextGenre: string | null) {
+		if (!data.library) return; // the unscoped all-channels view has no library key
+		const entry =
+			nextSort === 'name' && !nextGenre
+				? null
+				: {
+						...(nextSort !== 'name' ? { sort: nextSort } : {}),
+						...(nextGenre ? { genre: nextGenre } : {})
+					};
+		fetch('/api/v1/me', {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ browse: { [String(data.library.id)]: entry } }),
+			keepalive: true
+		}).catch(() => {});
+	}
+
+	function setGenre(g: string | null) {
+		genre = g;
+		persistBrowse(data.sort, g);
+	}
 	const genres = $derived(
 		[...new Set(data.channels.flatMap((c) => c.genres ?? []))].sort((a, b) => a.localeCompare(b))
 	);
+	// A saved genre that matches nothing here (stale, or saved against different content) must not
+	// filter — its chip may not even render, so an applied-but-invisible filter would blank the
+	// grid with no way to see why. The stored pref stays; it just has no effect until it matches.
+	const effectiveGenre = $derived(genre && genres.includes(genre) ? genre : null);
 	const shownChannels = $derived(
-		genre ? data.channels.filter((c) => c.genres?.includes(genre!)) : data.channels
+		effectiveGenre ? data.channels.filter((c) => c.genres?.includes(effectiveGenre)) : data.channels
 	);
 
 	// Show/hide fully-watched channels, preserving ?library/?sort — the same "show watched" toggle
@@ -35,6 +69,7 @@
 	// Re-sort in place, preserving ?library. 'name' is the default → drop the param to keep URLs clean.
 	function setSort(e: Event) {
 		const value = (e.currentTarget as HTMLSelectElement).value;
+		persistBrowse(value, genre);
 		const url = new URL(page.url);
 		if (value === 'name') url.searchParams.delete('sort');
 		else url.searchParams.set('sort', value);
@@ -46,8 +81,9 @@
 
 <div class="mb-5 flex items-baseline gap-3">
 	<h1 class="text-xl font-bold capitalize tracking-tight">{heading}</h1>
+	<!-- The count is of what's ON SCREEN (contract §Browse controls) — a genre filter re-counts. -->
 	<span class="font-mono text-xs text-faint"
-		>{data.channels.length}
+		>{shownChannels.length}
 		{data.library ? noun : 'total'}{data.hiddenWatched > 0
 			? ` · ${data.hiddenWatched} watched hidden`
 			: ''}</span
@@ -91,15 +127,17 @@
 	{#if genres.length > 0}
 		<div class="mb-4 flex flex-wrap gap-1.5">
 			<button
-				onclick={() => (genre = null)}
-				class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === null
+				onclick={() => setGenre(null)}
+				class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {effectiveGenre ===
+				null
 					? 'border-primary/60 text-primary'
 					: 'border-line text-muted hover:text-base-content'}">all</button
 			>
 			{#each genres as g (g)}
 				<button
-					onclick={() => (genre = genre === g ? null : g)}
-					class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === g
+					onclick={() => setGenre(effectiveGenre === g ? null : g)}
+					class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {effectiveGenre ===
+					g
 						? 'border-primary/60 text-primary'
 						: 'border-line text-muted hover:text-base-content'}">{g}</button
 				>

@@ -1,5 +1,6 @@
 import { listChannels, isFullyWatched, type ChannelSort } from '$lib/server/queries';
 import { getLibrary } from '$lib/server/libraries';
+import { getUserPrefs } from '$lib/server/prefs';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = ({ url, locals }) => {
@@ -8,8 +9,12 @@ export const load: PageServerLoad = ({ url, locals }) => {
 	const raw = url.searchParams.get('library');
 	const libraryId = raw && /^\d+$/.test(raw) ? Number(raw) : null;
 	const library = libraryId != null ? getLibrary(libraryId) : null;
-	// Optional ?sort — default 'name' for anything else.
-	const s = url.searchParams.get('sort');
+	// Sort: an explicit ?sort wins; otherwise the library's SAVED browse state applies (contract
+	// §Browse persistence — the sort chosen on the TV is how this library opens here too). Default
+	// 'name' for anything else. The unscoped all-channels view has no library key → no persistence.
+	const saved =
+		library && locals.user ? getUserPrefs(locals.user.id).browse[String(library.id)] : undefined;
+	const s = url.searchParams.get('sort') ?? saved?.sort ?? null;
 	const sort: ChannelSort = s === 'updated' || s === 'unwatched' ? s : 'name';
 	// Fully-watched channels/series are hidden by default (a finished show leaves the grid);
 	// ?watched=1 reveals them — the same convention as the feed and the channel detail page.
@@ -23,6 +28,8 @@ export const load: PageServerLoad = ({ url, locals }) => {
 		hiddenWatched: all.length - channels.length,
 		showWatched,
 		library: library ? { id: library.id, name: library.name, format: library.format } : null,
-		sort
+		sort,
+		// This library's saved genre filter (client-side chips restore it; §Browse persistence).
+		savedGenre: saved?.genre ?? null
 	};
 };

@@ -7,6 +7,7 @@ import {
 	MIN_PASSWORD_LEN
 } from '$lib/server/auth';
 import { isOwner } from '$lib/server/visibility';
+import { getUserPrefs, setUserPrefs } from '$lib/server/prefs';
 import {
 	plexUrl,
 	setPlexUrl,
@@ -35,6 +36,7 @@ export const load: PageServerLoad = ({ locals }) => {
 	return {
 		username: locals.user.username,
 		isOwner: owner,
+		prefs: getUserPrefs(locals.user.id),
 		// Plex section: users see it once the owner configures the server; the OWNER always sees it
 		// (server settings live HERE — no separate admin page/menu entry by design).
 		plex: {
@@ -70,6 +72,18 @@ export const load: PageServerLoad = ({ locals }) => {
 };
 
 export const actions: Actions = {
+	// Caption appearance. Server-owned (prefs.ts) so it follows the user to every device rather than
+	// being re-set on each one — the point of the setting for someone who needs larger captions.
+	subtitlePrefs: async ({ request, locals }) => {
+		if (!locals.user) throw error(401);
+		const data = await request.formData();
+		setUserPrefs(locals.user.id, {
+			subtitleSize: String(data.get('size') ?? '') as 'small' | 'medium' | 'large',
+			subtitleColor: String(data.get('color') ?? '') as 'white' | 'yellow'
+		});
+		return { ok: true };
+	},
+
 	// (Was the default action — named when the Plex section landed; the form posts ?/password.)
 	password: async ({ request, locals }) => {
 		if (!locals.user) throw error(401);

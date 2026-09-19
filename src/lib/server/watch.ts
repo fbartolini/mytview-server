@@ -20,7 +20,24 @@ export function saveWatch(
 	patch: { position?: number; watched?: boolean }
 ): void {
 	const cur = getWatch(userId, videoId);
-	const watched = patch.watched ?? cur.watched;
+	let watched = patch.watched ?? cur.watched;
+	// REWATCH RULE (owner decision 2026-08-18, ⇔ Plex): when a client reports a real mid-video
+	// position and says nothing about the flag, the flag FOLLOWS the position across the watched
+	// threshold — in both directions:
+	//  · a WATCHED video played again past the 5s floor but short of the threshold flips back to
+	//    in-progress and KEEPS the offset, so the next open resumes there. (Before this, the
+	//    watched rule below zeroed every rewatch write and replay always started at 0.)
+	//  · an UNWATCHED video reported at/past the threshold becomes watched — the same curve the
+	//    clients mark by, applied server-side, which also re-marks a rewatch that runs to the end
+	//    (the client's own auto-mark skips items it loaded as already-watched).
+	// Unknown duration → no threshold → the flag never flips implicitly.
+	if (patch.watched === undefined && patch.position !== undefined && patch.position > 5) {
+		const row = db().prepare('SELECT duration FROM videos WHERE id = ?').get(videoId) as
+			| { duration: number | null }
+			| undefined;
+		const end = watchedAtSeconds(row?.duration);
+		if (end !== null) watched = patch.position >= end ? true : false;
+	}
 	// Server rule: a watched video has no resume point — force position to 0 so no client leaves a
 	// stale offset behind (and none needs to send position:0 itself).
 	const position = watched ? 0 : (patch.position ?? cur.position);

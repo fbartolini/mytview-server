@@ -3,7 +3,7 @@ import { scanStatus } from '$lib/server/indexer';
 import { libraryCounts } from '$lib/server/queries';
 import { listLibraries } from '$lib/server/libraries';
 import { hlsEnabled } from '$lib/server/hls';
-import { SERVER_VERSION } from '$lib/server/config';
+import { BUILD_SHA, SERVER_VERSION } from '$lib/server/config';
 import type { RequestHandler } from './$types';
 
 export const GET: RequestHandler = ({ locals }) => {
@@ -29,6 +29,7 @@ export const GET: RequestHandler = ({ locals }) => {
 		transcoding: 0, // always 0 since the background whole-file transcoder was removed; kept for client shape-compat
 		// Mirrors /api/v1/status — one negotiation surface, both API layers (see the v1 route).
 		serverVersion: SERVER_VERSION,
+		serverBuild: BUILD_SHA, // short commit of the running build; null on a dev run
 		capabilities: ['libraries', 'series', 'movies', 'sessions', 'prefs', 'shares', 'federation', ...(hlsEnabled() ? ['hls'] : [])]
 	});
 };

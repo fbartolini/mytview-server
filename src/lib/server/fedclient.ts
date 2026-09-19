@@ -69,6 +69,10 @@ export interface FedPlaybackUrls {
 	url: string;
 	hlsUrl: string | null;
 	ext: string;
+	/** The PEER's subtitle tracks, already signed by it. Absolute after absolutize(), so clients pass
+	 *  them through verbatim exactly as they do the media URL (contract §Federation). Older peers
+	 *  don't send this field — an empty list, never a failure. */
+	subtitles: { lang: string | null; label: string; kind: 'captions' | 'subtitles'; url: string }[];
 }
 
 const requireBase = (link: FedLink): string => {
@@ -135,6 +139,9 @@ export async function fedPlaybackUrls(fedVideoId: string): Promise<FedPlaybackUr
 				// rel paths keep `.m3u8` before the `?` — the shape ExoPlayer's MIME sniff needs.
 				url: base + rel.url,
 				hlsUrl: rel.hlsUrl ? base + rel.hlsUrl : null,
+				subtitles: Array.isArray(rel.subtitles)
+					? rel.subtitles.map((t) => ({ ...t, url: base + t.url }))
+					: [],
 				ext: rel.ext
 			};
 			_urlCache.set(fedVideoId, { abs, exp: Date.now() + 5 * 60_000 });

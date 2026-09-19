@@ -4,7 +4,8 @@
  * EPHEMERAL by design: a session's segments live in a per-session temp dir only WHILE watching, and are
  * GC'd on idle + shutdown — there are NO persistent copies (unlike the whole-file TRANSCODE_DIR). This is
  * the compat FALLBACK for formats a client can't decode (HEVC / .mkv on web + Apple); direct-play stays
- * the default. Output is the SOURCE resolution — codec/container only, no downscaling (that's ABR, later).
+ * the default. Output is the SOURCE resolution — unless THIS host proves too slow for it, when it steps
+ * down to 1080p/720p mid-session (see ADAPTIVE DOWNSCALE). Still one rendition, never ABR.
  *
  * A session serves a complete VOD playlist up front (real length + seekbar). One active ffmpeg per session
  * transcodes forward from a start segment; a seek beyond the transcoded window RESTARTS ffmpeg at the
@@ -47,13 +48,19 @@ const SEG_KEEP = Math.max(HLS_SESSION_MAX_SEG, CATCHUP + AHEAD_HYST);
 
 export const hlsEnabled = (): boolean => HLS_DIR != null;
 
+// The render node VAAPI encodes through. One const so the About page's capability report and the
+// ffmpeg args can never disagree about which device we're claiming.
+const VAAPI_DEVICE = '/dev/dri/renderD128';
+
 interface Session {
 	id: string;
 	videoId: string;
 	srcAbs: string;
 	dir: string;
 	duration: number;
-	active: { start: number; proc: ChildProcess } | null;
+	/** The running encoder. `speed` = its steady-state measurement (see ADAPTIVE DOWNSCALE): the first
+	 *  real progress sample, and `done` once a verdict is in (or the job was throttled — proof of speed). */
+	active: { start: number; proc: ChildProcess; speed: { wall: number; out: number } | null; done: boolean } | null;
 	createdAt: number;
 	lastAccess: number;
 	lastFetched: number; // highest segment the player has requested — the play head, for the ahead-throttle
@@ -64,11 +71,119 @@ interface Session {
 	fed: { linkId: number; key: string } | null;
 	frontier: number;    // cached forward-only production frontier (first not-yet-produced seg); reset on spawn
 	paused: boolean;     // ffmpeg SIGSTOP'd because it raced > HLS_AHEAD_SEG ahead of the play head
-	hdr: boolean;        // source is HDR → tonemap on the CPU path (VAAPI is skipped for HDR)
+	hdr: boolean;        // source is HDR → needs a tonemap (GPU for PQ when VAAPI is on, else the CPU chain)
+	pq: boolean;         // HDR10/PQ specifically — what tonemap_vaapi maps (HLG stays on the CPU chain)
+	width: number | null;  // source video dimensions (null = unprobed → never downscaled)
+	height: number | null;
+	probeKey: string;    // `${srcAbs}:${mtimeMs}` — keys the remembered slow-source verdict
+	scaleStep: number;   // SCALE_LADDER rung in use (0 = source resolution)
+	audio: number | null; // absolute index of the audio stream to encode (the file's DEFAULT one); null = ffmpeg picks
+	reqAudio: number | null; // what the CALLER asked for (null = "whatever the file defaults to") — the reuse key
+	/** STREAM-COPY session: video + audio copied untouched into TS segments cut at the SOURCE's keyframes
+	 *  (no encode, original quality, ~I/O cost). Text/data tracks are dropped — the whole point for the
+	 *  text-stream-heavy containers that choke a 2018 Samsung demuxer (contract §preferHls). */
+	copy: boolean;
+	/** Copy sessions: each segment's START time = a keyframe timestamp (greedy ≥ SEG apart, `copyBoundaries`).
+	 *  Drives both the playlist's real durations and the restart-at-boundary math in ffmpegArgs. */
+	bounds: number[] | null;
+	reqCopy: boolean; // what the caller ASKED for (reuse key) — copy may be refused for an ineligible codec
+}
+
+// ---- STREAM-COPY mode --------------------------------------------------------------------------
+// The engine's seek model — a VOD playlist up front, segment N restartable at its start time — was
+// built on the encoder forcing a keyframe every SEG seconds. A copied stream can only be cut at the
+// source's own keyframes, so copy sessions carry their real segment starts (`bounds`) and the playlist
+// states the real durations. Verified offline against ffmpeg's actual cuts (10s-GOP HEVC and 1s-GOP
+// H.264): the hls muxer starts a new segment at the first keyframe ≥ (segment start + hls_time), which
+// `copyBoundaries` reproduces exactly, from any start.
+const COPY_VIDEO = new Set(['h264', 'hevc']); // what MPEG-TS carries and the TV decoders take natively
+const COPY_AUDIO = new Set(['aac', 'ac3', 'eac3', 'mp3']);
+// A restart at boundary N must START on its keyframe. `-ss` alone lands on the container's cue index —
+// which is NOT every keyframe (field: a request for 31.333 landed on 20.917, nine seconds of pre-roll).
+// So: a COARSE input seek well before the boundary (wherever it lands is fine), then an exact OUTPUT-side
+// `-ss` that discards packets until the boundary. ffmpeg compares that threshold against DTS, and a
+// keyframe's DTS trails its PTS by the reorder lag — a threshold AT the keyframe's PTS skips it and lands
+// the NEXT one (field-verified) — hence the lead. Everything before the keyframe that survives the
+// threshold is dropped by copy's own wait-for-keyframe rule, and `-output_ts_offset` restores the
+// absolute timeline (verified: a restart's first packet matches the from-zero run's to the millisecond,
+// bar the muxer's one-time negative-DTS shift at a file's very start — two frames, within tolerance).
+const COPY_COARSE_SEEK = 20;
+const COPY_TRIM_LEAD = 0.5;
+const KEYFRAME_SCAN_BUDGET_MS = 4000; // wait this long for a first-time keyframe scan; beyond it, encode THIS session
+
+/** Copy-mode segment start times from a keyframe list: every keyframe at least `seg` after the previous
+ *  start — ffmpeg's own cutting rule for a copied stream, so the playlist and the files agree. */
+export function copyBoundaries(keyframes: number[], seg = SEG): number[] {
+	const out: number[] = [];
+	for (const k of keyframes) if (!out.length || k >= out[out.length - 1] + seg) out.push(k);
+	return out;
+}
+
+// The source's keyframe timestamps — copy mode's one prerequisite. A demux-only packet scan (no decode;
+// I/O bound, about a second per GB on local disk), memoised per (path, mtime) and de-duplicated while
+// in flight. Bounded by a time budget at session start: within it, this session copies; beyond it,
+// this session ENCODES while the scan finishes in the background and the file's next session copies.
+// `end` = the last packet's timestamp: the stream's REAL end, which a container's declared duration can
+// overstate (a truncated or SponsorBlock-spliced file) — the copy playlist's last segment is clamped to it.
+type KeyScan = { keys: number[]; end: number };
+const keyframeCache = new Map<string, KeyScan | null>();
+const keyframeScans = new Map<string, Promise<KeyScan | null>>();
+function scanKeyframes(abs: string, key: string): Promise<KeyScan | null> {
+	const cached = keyframeCache.get(key);
+	if (cached !== undefined) return Promise.resolve(cached);
+	let p = keyframeScans.get(key);
+	if (!p) {
+		p = execFileP(
+			'ffprobe',
+			['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', abs],
+			{ timeout: 600_000, killSignal: 'SIGKILL', maxBuffer: 64 << 20 }
+		)
+			.then(({ stdout }) => {
+				const out: number[] = [];
+				let end = 0;
+				for (const line of stdout.split('\n')) {
+					const c = line.indexOf(',');
+					if (c < 0) continue;
+					const t = Number(line.slice(0, c));
+					if (!Number.isFinite(t)) continue;
+					if (t > end) end = t;
+					if (line.indexOf('K', c) >= 0) out.push(t);
+				}
+				out.sort((a, b) => a - b);
+				return out.length ? { keys: out, end } : null;
+			})
+			.catch(() => null)
+			.then((r) => {
+				if (keyframeCache.size >= PROBE_CACHE_MAX) keyframeCache.clear();
+				keyframeCache.set(key, r);
+				keyframeScans.delete(key);
+				return r;
+			});
+		keyframeScans.set(key, p);
+	}
+	return p;
+}
+
+/** The audio streams' codecs by absolute index — copy eligibility is per CHOSEN track (a DTS track
+ *  can't ride in TS; the same file's AAC track can). */
+async function probeAudioCodecs(abs: string): Promise<Map<number, string>> {
+	const out = new Map<number, string>();
+	try {
+		const { stdout } = await execFileP('ffprobe', [
+			'-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index,codec_name', '-of', 'json', abs
+		], { timeout: 10_000, killSignal: 'SIGKILL' });
+		for (const st of (JSON.parse(stdout) as { streams?: { index: number; codec_name?: string }[] }).streams ?? []) {
+			if (st.codec_name) out.set(st.index, st.codec_name.toLowerCase());
+		}
+	} catch {
+		/* no audio info → not copy-eligible */
+	}
+	return out;
 }
 const sessions = new Map<string, Session>();
 let hwDisabled = false; // set once VAAPI proves unusable on this host → CPU from then on
 let tonemapDisabled = false; // set once the HDR tonemap proves unrunnable (no libzimg / bad primaries) → plain 8-bit
+let gpuTonemapDisabled = false; // set once tonemap_vaapi fails a real encode → HDR back to the CPU chain
 let gcStarted = false;
 let sweepPromise: Promise<void> | null = null; // shared one-time boot sweep (memoized so concurrent callers await the SAME completion)
 
@@ -92,17 +207,97 @@ async function probeDuration(abs: string): Promise<number | null> {
 const TONEMAP_VF =
 	'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
 
-/** Is the source HDR (PQ/HLG transfer)? Gates the tonemap — a plain 8-bit downconvert of HDR washes out grey. */
-async function probeHdr(abs: string): Promise<boolean> {
+/** The source's first video stream: HDR (PQ/HLG transfer — gates the tonemap, since a plain 8-bit downconvert
+ *  of HDR washes out grey) and its dimensions (what the adaptive downscale steps down from). */
+async function probeVideo(
+	abs: string
+): Promise<{ hdr: boolean; pq: boolean; width: number | null; height: number | null; vcodec: string | null }> {
 	try {
 		const { stdout } = await execFileP('ffprobe', [
-			'-v', 'error', '-select_streams', 'V:0', '-show_entries', 'stream=color_transfer',
-			'-of', 'default=noprint_wrappers=1:nokey=1', abs
+			'-v', 'error', '-select_streams', 'V:0', '-show_entries', 'stream=codec_name,color_transfer,width,height',
+			'-of', 'json', abs
 		], { timeout: 10_000, killSignal: 'SIGKILL' });
-		const t = stdout.trim().toLowerCase();
-		return t === 'smpte2084' || t === 'arib-std-b67';
+		const st = (JSON.parse(stdout) as {
+			streams?: { codec_name?: string; color_transfer?: string; width?: number; height?: number }[];
+		}).streams?.[0];
+		const t = (st?.color_transfer ?? '').toLowerCase();
+		return {
+			hdr: t === 'smpte2084' || t === 'arib-std-b67',
+			pq: t === 'smpte2084',
+			width: st?.width && st.width > 0 ? st.width : null,
+			height: st?.height && st.height > 0 ? st.height : null,
+			vcodec: st?.codec_name ? st.codec_name.toLowerCase() : null
+		};
 	} catch {
-		return false;
+		return { hdr: false, pq: false, width: null, height: null, vcodec: null };
+	}
+}
+
+// ADAPTIVE DOWNSCALE — only when THIS host can't keep up, never as a default.
+//
+// Output starts at the source resolution. Each encoder job measures its own steady-state speed (encoded
+// media seconds per wall second, from ffmpeg's -progress feed, excluding the startup/seek cost before the
+// first frame). Below HLS_MIN_SPEED the player can never build a buffer — it stalls forever (field
+// 2026-09-13: 4K HEVC → 4K H.264 on CPU at ~0.3× real time; the Tizen audio switch simply never played).
+// Then the job restarts at its frontier one rung down this ladder, and the verdict is remembered per
+// source file so later sessions of it (seeks, audio switches, the next viewer) start at that rung
+// instead of re-learning it. A source already inside a rung's box skips it. A fast host, or a light
+// source, is never touched. This is NOT ABR: still one rendition per session, chosen by the SERVER's
+// capacity, not the viewer's bandwidth.
+const SCALE_LADDER = [
+	{ w: 1920, h: 1080 },
+	{ w: 1280, h: 720 }
+];
+const HLS_MIN_SPEED = 1.05; // steady-state encode speed below which playback cannot keep a buffer
+const SPEED_WINDOW_MS = 10_000; // how long a job is measured before the verdict
+const slowSources = new Map<string, number>(); // probe key → ladder rung this host needed for that file
+
+/** Output dimensions at ladder rung `step` (0 = source), or null when that rung wouldn't shrink the source. */
+function scaledSize(width: number | null, height: number | null, step: number): { w: number; h: number } | null {
+	if (step <= 0 || !width || !height) return null;
+	const box = SCALE_LADDER[Math.min(step, SCALE_LADDER.length) - 1];
+	const r = Math.min(box.w / width, box.h / height);
+	if (r >= 1) return null;
+	const even = (n: number) => Math.max(2, 2 * Math.round(n / 2));
+	return { w: even(width * r), h: even(height * r) };
+}
+/** The next rung that actually shrinks this source, or null when there's nowhere left to go. */
+function nextScaleStep(s: Session): number | null {
+	for (let k = s.scaleStep + 1; k <= SCALE_LADDER.length; k++) {
+		if (scaledSize(s.width, s.height, k)) return k;
+	}
+	return null;
+}
+
+/**
+ * Which audio stream to transcode. Returns an ABSOLUTE stream index, or null for "let ffmpeg decide".
+ *
+ * `-map 0:a:0?` — the previous behaviour — always took the FIRST audio stream and ignored what the
+ * file itself says. On a release whose first track is a dub and whose second is the original, that
+ * plays the wrong language every single time, consistently enough to look like a setting rather than
+ * a bug. Containers record the answer in the `default` disposition, and *arr-style rips set it; we
+ * simply never read it. (ffmpeg's own automatic selection doesn't help — it picks by channel count,
+ * not disposition.)
+ *
+ * Still a fallback, not a chooser: a viewer who wants a NON-default track needs a picker, which is a
+ * separate feature (the track has to be selected server-side, since HTML5 video cannot switch audio
+ * tracks inside a container).
+ */
+async function probeDefaultAudio(abs: string): Promise<number | null> {
+	try {
+		const { stdout } = await execFileP('ffprobe', [
+			'-v', 'error', '-select_streams', 'a',
+			'-show_entries', 'stream=index:stream_disposition=default',
+			'-of', 'json', abs
+		], { timeout: 10_000, killSignal: 'SIGKILL' });
+		const streams = (JSON.parse(stdout) as {
+			streams?: { index: number; disposition?: Record<string, number> }[];
+		}).streams ?? [];
+		if (streams.length <= 1) return null; // one track (or none): nothing to choose, keep ffmpeg's
+		const flagged = streams.find((st) => st.disposition?.default);
+		return (flagged ?? streams[0]).index;
+	} catch {
+		return null;
 	}
 }
 
@@ -132,7 +327,19 @@ function sweepOrphans(): Promise<void> {
 // index.m3u8 GET, and players routinely fetch a VOD playlist 2–4× at playback start (Safari), so a
 // single play could spawn 8 probe processes and a scripted loop unbounded ones. Bounded by wholesale
 // clear (simplest; refilling costs one probe pair per file on next play).
-const probeCache = new Map<string, { duration: number | null; hdr: boolean }>();
+const probeCache = new Map<
+	string,
+	{
+		duration: number | null;
+		hdr: boolean;
+		pq: boolean;
+		width: number | null;
+		height: number | null;
+		audio: number | null;
+		vcodec: string | null;
+		acodecs: Map<number, string>;
+	}
+>();
 const PROBE_CACHE_MAX = 512;
 
 // Bound TOTAL session entries (temp dirs + Map rows). HLS_MAX_SESSIONS caps concurrent ENCODERS at
@@ -140,20 +347,73 @@ const PROBE_CACHE_MAX = 512;
 // (30 min), so a playlist flood accumulated dirs and Map entries freely.
 const MAX_TOTAL_SESSIONS = HLS_MAX_SESSIONS * 4;
 
+/**
+ * What the live transcoder can actually do ON THIS HOST — the About page's playback report.
+ *
+ * `hwaccel` is the state RIGHT NOW, not the configured wish: 'off' = never asked for,
+ * 'unavailable' = asked for but the render node is missing or VAAPI already failed a real encode
+ * (the `hwDisabled` latch, so this flips mid-run the first time it's disproved), 'on' = asked for
+ * and not disproved. That distinction is the whole point — an owner who set TRANSCODE_HWACCEL=1
+ * has no other way to find out their container never got /dev/dri passed through.
+ */
+export function hlsStatus(): {
+	enabled: boolean;
+	hwaccel: 'off' | 'on' | 'unavailable';
+	device: boolean;
+	encoding: number;
+	sessions: number;
+	maxEncoders: number;
+} {
+	const device = existsSync(VAAPI_DEVICE);
+	return {
+		enabled: HLS_DIR != null,
+		hwaccel: !TRANSCODE_HWACCEL ? 'off' : hwDisabled || !device ? 'unavailable' : 'on',
+		device,
+		encoding: activeCount(),
+		sessions: sessions.size,
+		maxEncoders: HLS_MAX_SESSIONS
+	};
+}
+
+let ffmpegProbe: Promise<string | null> | null = null;
+
+/** ffmpeg's version string, probed once per process (the binary can't change under a running
+ *  container). null = not on PATH — which means no live transcode AND no image cache, the one
+ *  server-side fact worth surfacing in the UI because everything else still looks fine. */
+export function ffmpegVersion(): Promise<string | null> {
+	ffmpegProbe ??= execFileP('ffmpeg', ['-version'], { timeout: 5000 })
+		.then(({ stdout }) => /ffmpeg version (\S+)/.exec(stdout)?.[1] ?? 'present')
+		.catch(() => null);
+	return ffmpegProbe;
+}
+
 /** Create (or reuse) a session for a video (called by the index.m3u8 route AFTER auth). Returns
  *  { sid, playlist } or null (disabled / unknown video / unreadable source / unknown duration / full). */
 export async function startHlsSession(
 	videoId: string,
-	fed: { linkId: number; key: string } | null = null
+	fed: { linkId: number; key: string } | null = null,
+	audioIndex: number | null = null,
+	wantCopy = false
 ): Promise<{ sid: string; playlist: string } | null> {
 	if (!HLS_DIR) return null;
 	// Playlist refetch collapse: reuse a just-minted session for the same video that nobody has pulled
 	// a segment from yet (the Safari/AVPlayer multi-fetch at start), instead of minting a dir + probes
 	// per GET. Once a segment has been fetched the session is someone's live playback — never shared.
 	for (const s of sessions.values()) {
-		if (s.videoId === videoId && !s.everFetched && Date.now() - s.createdAt < 20_000) {
+		// Must match the requested AUDIO too: two viewers on the same film in different languages are
+		// two different encodes, and collapsing them would hand one of them the other's soundtrack.
+		// Match on what was ASKED FOR, not on the resolved stream: `null` means "the file's default",
+		// which is only known after a probe — comparing loosely would let a request for the default
+		// collapse onto a session someone minted for an explicit second language.
+		if (
+			s.videoId === videoId &&
+			s.reqAudio === audioIndex &&
+			s.reqCopy === wantCopy && // a copy playlist and an encode playlist address DIFFERENT segments
+			!s.everFetched &&
+			Date.now() - s.createdAt < 20_000
+		) {
 			s.lastAccess = Date.now();
-			return { sid: s.id, playlist: buildPlaylist(s.id, s.duration) };
+			return { sid: s.id, playlist: buildPlaylist(s) };
 		}
 	}
 	const row = db().prepare('SELECT video_path, duration FROM videos WHERE id = ?').get(videoId) as
@@ -176,19 +436,53 @@ export async function startHlsSession(
 	const cacheKey = `${srcAbs}:${mtimeMs}`;
 	let probed = probeCache.get(cacheKey);
 	if (!probed) {
-		probed = { duration: await probeDuration(srcAbs), hdr: await probeHdr(srcAbs) };
+		probed = {
+			duration: await probeDuration(srcAbs),
+			...(await probeVideo(srcAbs)),
+			audio: await probeDefaultAudio(srcAbs),
+			acodecs: await probeAudioCodecs(srcAbs)
+		};
 		if (probeCache.size >= PROBE_CACHE_MAX) probeCache.clear();
 		probeCache.set(cacheKey, probed);
 	}
 	const duration = probed.duration ?? (row.duration && row.duration > 0 ? row.duration : null);
 	if (!duration) return null;
 	const hdr = probed.hdr;
+	// Copy eligibility: what TS can carry for the chosen track pair. Refused silently → a normal encode.
+	let bounds: number[] | null = null;
+	let copyEnd = duration;
+	if (wantCopy) {
+		const aIdx = audioIndex ?? probed.audio ?? [...probed.acodecs.keys()][0];
+		const acodec = aIdx != null ? probed.acodecs.get(aIdx) : undefined;
+		if (probed.vcodec && COPY_VIDEO.has(probed.vcodec) && acodec && COPY_AUDIO.has(acodec)) {
+			const scan = await Promise.race([
+				scanKeyframes(srcAbs, cacheKey),
+				new Promise<undefined>((r) => setTimeout(r, KEYFRAME_SCAN_BUDGET_MS))
+			]);
+			if (scan) {
+				// The playlist must end where the DATA ends, not where the header claims it does.
+				copyEnd = Math.min(duration, scan.end + 0.1);
+				const inRange = scan.keys.filter((t) => t < copyEnd);
+				bounds = inRange.length ? copyBoundaries(inRange) : null;
+			}
+		}
+	}
 	// At the total-session cap: evict the OLDEST never-fetched session (mint-storm leftovers). If every
 	// session is genuinely being watched, refuse — the route 404s and the client retries/fails soft.
 	if (sessions.size >= MAX_TOTAL_SESSIONS) {
 		let victim: Session | null = null;
 		for (const s of sessions.values()) {
 			if (!s.everFetched && (!victim || s.createdAt < victim.createdAt)) victim = s;
+		}
+		// Nothing never-fetched → reclaim the longest-IDLE fetched one, if it's past the encoder reap. Those
+		// are abandoned retries/switches that TTL (30 min) would otherwise pin, 404-ing every new playlist
+		// for half an hour after a client retry storm. A paused viewer loses only the re-mint shortcut:
+		// their next segment 404s, the same wall a TTL-expired session hits (web re-mints at the same spot).
+		if (!victim) {
+			const idleBefore = Date.now() - HLS_IDLE_SEC * 1000;
+			for (const s of sessions.values()) {
+				if (s.lastAccess < idleBefore && (!victim || s.lastAccess < victim.lastAccess)) victim = s;
+			}
 		}
 		if (!victim) return null;
 		destroySession(victim);
@@ -199,22 +493,39 @@ export async function startHlsSession(
 	const sid = crypto.randomBytes(16).toString('hex');
 	const dir = mkdtempSync(path.join(HLS_DIR, 'sess-'));
 	sessions.set(sid, {
-		id: sid, videoId, srcAbs, dir, duration,
+		// An explicitly CHOSEN track wins over the file's default. Validated by the caller against the
+		// file's real streams, so this can only ever be one of them.
+		id: sid, videoId, srcAbs, dir, duration: bounds ? copyEnd : duration, audio: audioIndex ?? probed.audio, reqAudio: audioIndex,
 		active: null, createdAt: Date.now(), lastAccess: Date.now(), lastFetched: 0, everFetched: false,
-		fed, frontier: 0, paused: false, hdr
+		fed, frontier: 0, paused: false, hdr, pq: probed.pq, width: probed.width, height: probed.height,
+		probeKey: cacheKey, scaleStep: slowSources.get(cacheKey) ?? 0,
+		copy: bounds != null, bounds, reqCopy: wantCopy
 	});
 	startGc();
-	return { sid, playlist: buildPlaylist(sid, duration) };
+	return { sid, playlist: buildPlaylist(sessions.get(sid)!) };
 }
 
-/** Complete VOD playlist (real length + seekbar up front), segments as session-scoped absolute URLs. */
-function buildPlaylist(sid: string, duration: number): string {
-	const n = Math.ceil(duration / SEG);
-	const sig = hlsQuery(sid); // one signature for the whole session's segments
+/** Complete VOD playlist (real length + seekbar up front), segments as session-scoped absolute URLs.
+ *  Encode sessions: a fixed SEG grid (the encoder forces a keyframe per segment). Copy sessions: the
+ *  REAL segment starts (source keyframes), so every EXTINF is exact and TARGETDURATION covers the
+ *  longest GOP. */
+function buildPlaylist(s: Session): string {
+	const sig = hlsQuery(s.id); // one signature for the whole session's segments
+	if (s.copy && s.bounds) {
+		const b = s.bounds;
+		const durs = b.map((t, i) => (i < b.length - 1 ? b[i + 1] - t : Math.max(0.1, s.duration - t)));
+		const target = Math.ceil(Math.max(...durs));
+		let m = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${target}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
+		durs.forEach((d, i) => {
+			m += `#EXTINF:${d.toFixed(6)},\n/hls/s/${s.id}/${segName(i)}?${sig}\n`;
+		});
+		return m + '#EXT-X-ENDLIST\n';
+	}
+	const n = Math.ceil(s.duration / SEG);
 	let m = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${SEG}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
 	for (let i = 0; i < n; i++) {
-		const dur = i < n - 1 ? SEG : duration - (n - 1) * SEG;
-		m += `#EXTINF:${dur.toFixed(6)},\n/hls/s/${sid}/${segName(i)}?${sig}\n`;
+		const dur = i < n - 1 ? SEG : s.duration - (n - 1) * SEG;
+		m += `#EXTINF:${dur.toFixed(6)},\n/hls/s/${s.id}/${segName(i)}?${sig}\n`;
 	}
 	return m + '#EXT-X-ENDLIST\n';
 }
@@ -230,6 +541,7 @@ export function hlsSessionFed(sid: string): { linkId: number; key: string } | nu
 export async function hlsSegment(sid: string, n: number): Promise<string | null> {
 	const s = sessions.get(sid);
 	if (!s || !Number.isInteger(n) || n < 0) return null;
+	if (s.copy && s.bounds && n >= s.bounds.length) return null; // past the last real segment
 	s.lastAccess = Date.now();
 	s.lastFetched = n; // the play head — the ahead-throttle keeps the encoder within HLS_AHEAD_SEG of this
 	s.everFetched = true; // now someone's live playback — no longer reusable/evictable at mint time
@@ -281,10 +593,51 @@ function ensureCovers(s: Session, n: number): boolean {
 	return true;
 }
 
+/** One -progress sample for `job` (media seconds encoded so far). Takes a baseline at the first frame, then
+ *  after SPEED_WINDOW_MS judges the steady-state speed ONCE per job — too slow → one rung down, at the frontier. */
+function onProgress(s: Session, job: NonNullable<Session['active']>, out: number) {
+	if (s.copy) return; // nothing to downscale — a copy runs at I/O speed, and there is no encoder to slow
+	if (job.done || s.active !== job || s.paused) return;
+	const now = Date.now();
+	if (!job.speed) {
+		if (out > 0) job.speed = { wall: now, out }; // first real frame: startup + input seek are behind us
+		return;
+	}
+	if (now - job.speed.wall < SPEED_WINDOW_MS) return;
+	job.done = true;
+	const speed = (out - job.speed.out) / ((now - job.speed.wall) / 1000);
+	if (speed >= HLS_MIN_SPEED) return;
+	const step = nextScaleStep(s);
+	if (step == null) return; // already as small as the ladder goes (or the source is) — nothing to trade
+	const to = scaledSize(s.width, s.height, step)!;
+	console.warn(
+		`[mytview] HLS: ${s.videoId} encoding at ${speed.toFixed(2)}x real time at ` +
+			`${scaledSize(s.width, s.height, s.scaleStep)?.w ?? s.width}px wide — this host can't keep up, ` +
+			`continuing at ${to.w}x${to.h}`
+	);
+	s.scaleStep = step;
+	if (slowSources.size >= PROBE_CACHE_MAX) slowSources.clear();
+	slowSources.set(s.probeKey, Math.max(step, slowSources.get(s.probeKey) ?? 0));
+	spawnAt(s, frontier(s)); // produced segments stay; everything from the frontier on comes out smaller
+}
+
 function spawnAt(s: Session, start: number) {
 	if (s.active) s.active.proc.kill('SIGKILL'); // abandon the position the user left
-	const proc = spawn('ffmpeg', ffmpegArgs(s, start), { stdio: ['ignore', 'ignore', 'pipe'] });
-	s.active = { start, proc };
+	const proc = spawn('ffmpeg', ffmpegArgs(s, start), { stdio: ['ignore', 'pipe', 'pipe'] });
+	const job = { start, proc, speed: null as { wall: number; out: number } | null, done: false };
+	s.active = job;
+	// -progress feed (stdout; always drained, so the pipe can never fill and block ffmpeg).
+	let buf = '';
+	proc.stdout?.on('data', (d) => {
+		buf += d.toString();
+		let nl: number;
+		while ((nl = buf.indexOf('\n')) >= 0) {
+			const line = buf.slice(0, nl);
+			buf = buf.slice(nl + 1);
+			const m = /^out_time_(?:us|ms)=(\d+)/.exec(line); // _ms is microseconds too (old ffmpeg naming)
+			if (m) onProgress(s, job, Number(m[1]) / 1e6);
+		}
+	});
 	s.frontier = start; // fresh job → rescan the frontier from here
 	s.paused = false;
 	let err = '';
@@ -308,11 +661,16 @@ function spawnAt(s: Session, start: number) {
 			s.active = null;
 			s.paused = false;
 		}
-		if (code && code !== 0 && !hwDisabled && TRANSCODE_HWACCEL && /vaapi|Device creation|renderD128/i.test(err)) {
+		// Most specific first: a tonemap_vaapi failure also matches the generic VAAPI and CPU-tonemap patterns,
+		// and must disable only the GPU tonemap — not VAAPI for every SDR stream, nor the CPU tonemap.
+		if (code && code !== 0 && !gpuTonemapDisabled && /tonemap_vaapi/i.test(err)) {
+			gpuTonemapDisabled = true;
+			console.warn('[mytview] HLS: GPU HDR tonemap failed — HDR sources fall back to the CPU tonemap');
+		} else if (code && code !== 0 && !hwDisabled && TRANSCODE_HWACCEL && /vaapi|Device creation|renderD128/i.test(err)) {
 			hwDisabled = true; // VAAPI unusable on this host → CPU from now on; the next segment restarts on CPU
 			console.warn('[mytview] HLS: VAAPI unavailable — using CPU for live transcode');
 		}
-		if (code && code !== 0 && !tonemapDisabled && /zscale|tonemap|zimg|no such filter/i.test(err)) {
+		if (code && code !== 0 && !tonemapDisabled && !/tonemap_vaapi/i.test(err) && /zscale|tonemap|zimg|no such filter/i.test(err)) {
 			tonemapDisabled = true; // HDR tonemap can't run here → plain 8-bit (washed-out but playable) from now on
 			console.warn('[mytview] HLS: HDR tonemap unavailable — falling back to a plain 8-bit downconvert');
 		}
@@ -320,22 +678,56 @@ function spawnAt(s: Session, start: number) {
 }
 
 function ffmpegArgs(s: Session, start: number): string[] {
+	if (s.copy && s.bounds) {
+		// STREAM COPY — see the block comment at COPY_COARSE_SEEK for why the seek is built this way.
+		const t = s.bounds[start] ?? s.bounds[s.bounds.length - 1];
+		const trimAt = t - COPY_TRIM_LEAD;
+		const inSeek = Math.max(0, t - COPY_COARSE_SEEK);
+		// Within the lead of the file's start there is nothing to trim: play from the first packet, and
+		// the first segment IS boundary 0 (the from-zero run is what the boundaries were verified against).
+		const seek = trimAt > 0
+			? { pre: ['-ss', String(inSeek)], post: ['-ss', String(trimAt - inSeek), '-output_ts_offset', String(trimAt)] }
+			: { pre: [], post: [] };
+		return [
+			'-nostdin', '-y',
+			'-nostats', '-progress', 'pipe:1', // the ahead-throttle still reads the frontier; nothing measures speed
+			...seek.pre, '-i', s.srcAbs, ...seek.post,
+			'-map', '0:V:0', '-map', s.audio != null ? `0:${s.audio}` : '0:a:0?',
+			'-c', 'copy', '-sn', '-dn', // text + data tracks dropped: the demuxer relief this mode exists for
+			'-f', 'hls', '-hls_time', String(SEG), '-hls_list_size', '0', '-start_number', String(start),
+			'-hls_flags', 'temp_file',
+			'-hls_segment_filename', path.join(s.dir, 'seg%05d.ts'),
+			path.join(s.dir, 'ff.m3u8')
+		];
+	}
 	const off = start * SEG;
-	const hw = TRANSCODE_HWACCEL && !hwDisabled && !s.hdr; // HDR → CPU path (tonemap); VAAPI tonemapping is unreliable here
+	// HDR10 goes through the GPU too: decode + tonemap_vaapi + h264_vaapi. It used to be excluded ("VAAPI
+	// tonemapping is unreliable") without ever being measured; on the field iGPU (Intel iHD, 2026-09-13) the
+	// full-GPU chain ran 4K HDR10 at 4.37x real time, while the all-CPU zscale chain managed 0.014x and was
+	// OOM-killed (4K gbrpf32le frames). A failed GPU tonemap latches gpuTonemapDisabled → the CPU chain.
+	const gpuTonemap = s.hdr && s.pq && !gpuTonemapDisabled;
+	const hw = TRANSCODE_HWACCEL && !hwDisabled && (!s.hdr || gpuTonemap);
 	const useTonemap = s.hdr && !tonemapDisabled; // HDR, unless the tonemap already proved unrunnable → plain 8-bit
+	const size = scaledSize(s.width, s.height, s.scaleStep); // null = source resolution (the default)
+	const cpuScale = size ? `scale=${size.w}:${size.h},` : ''; // scale BEFORE the tonemap: far fewer pixels to map
 	// -ss BEFORE -i = fast input seek to the keyframe ≤ off; -output_ts_offset shifts PTS back to `off` so
 	// seg N lines up with the playlist timeline; -start_number N names the segments absolutely. Force 8-bit
 	// (yuv420p / nv12) — 10-bit HEVC → H.264 High10 is undecodable by browsers/MSE. Audio → AAC-LC stereo.
 	return [
 		'-nostdin', '-y',
-		...(hw ? ['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi', '-vaapi_device', '/dev/dri/renderD128'] : []),
+		'-nostats', '-progress', 'pipe:1', // machine-readable progress on stdout → the speed measurement
+		...(hw ? ['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi', '-vaapi_device', VAAPI_DEVICE] : []),
 		'-ss', String(off), '-i', s.srcAbs,
-		'-map', '0:V:0', '-map', '0:a:0?',
+		// Audio: the stream the FILE flags as default, not simply the first one (probeDefaultAudio).
+		'-map', '0:V:0', '-map', s.audio != null ? `0:${s.audio}` : '0:a:0?',
 		...(hw
-			? ['-vf', 'scale_vaapi=format=nv12', '-c:v', 'h264_vaapi', '-low_power', '1', '-qp', '23']
+			? ['-vf', (s.hdr ? 'tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,' : '') +
+					(size ? `scale_vaapi=w=${size.w}:h=${size.h}:format=nv12` : 'scale_vaapi=format=nv12'),
+				'-c:v', 'h264_vaapi', '-low_power', '1', '-qp', '23']
 			: useTonemap
-				? ['-vf', TONEMAP_VF, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'] // tonemap chain ends in yuv420p
-				: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']),
+				? ['-vf', cpuScale + TONEMAP_VF, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'] // tonemap chain ends in yuv420p
+				: [...(size ? ['-vf', cpuScale.slice(0, -1)] : []),
+					'-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']),
 		'-force_key_frames', `expr:gte(t,n_forced*${SEG})`,
 		'-c:a', 'aac', '-b:a', '160k', '-ac', '2',
 		'-output_ts_offset', String(off),
@@ -367,6 +759,7 @@ function throttle(s: Session): void {
 	if (!s.paused && ahead > HLS_AHEAD_SEG) {
 		s.active.proc.kill('SIGSTOP');
 		s.paused = true;
+		s.active.done = true; // raced a full buffer ahead → fast enough; a frozen clock must not read as slow
 	} else if (s.paused && ahead <= HLS_AHEAD_SEG - AHEAD_HYST) {
 		s.active.proc.kill('SIGCONT');
 		s.paused = false;

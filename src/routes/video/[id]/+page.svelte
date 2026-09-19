@@ -83,6 +83,10 @@
 					stillWatchingAfter={data.prefs.stillWatchingAfter}
 					preferCompat={data.preferCompat}
 					hlsEnabled={data.hlsEnabled}
+					subtitles={data.subtitles}
+					audioTracks={data.audioTracks}
+					subtitleSize={data.prefs.subtitleSize}
+					subtitleColor={data.prefs.subtitleColor}
 					srcUrl={data.srcUrl}
 					hlsUrl={data.hlsUrl}
 					remote={data.remote}

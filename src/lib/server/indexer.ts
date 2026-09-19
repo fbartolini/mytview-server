@@ -31,6 +31,7 @@ import { gcShares } from './share';
 import { applyNewChannelDefault } from './visibility';
 import { warmImage } from './imagecache';
 import { resolveInMediaRoot } from './files';
+import { findSubtitles } from './subtitles';
 
 const MEDIA_EXTS = ['.mp4', '.mkv', '.webm', '.m4v'];
 const THUMB_EXTS = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -39,6 +40,7 @@ const FANART_NAMES = ['fanart.jpg', 'fanart.png', 'fanart.webp', 'banner.jpg'];
 const INFO_SUFFIX = '.info.json';
 const NFO_SUFFIX = '.nfo';
 const BATCH = 25; // files processed between event-loop yields
+const SUB_CHUNK = 200; // videos whose subtitle rows are rewritten per transaction (syncSubtitles)
 
 const rel = (p: string): string => path.relative(MEDIA_ROOT, p);
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -797,6 +799,7 @@ export async function scan(full = false): Promise<ScanStats> {
 		)
 		.run();
 	const pruned = deadVideos.length;
+	await syncSubtitles(database);
 	gcShares(); // drop expired share links
 
 	return {
@@ -806,6 +809,81 @@ export async function scan(full = false): Promise<ScanStats> {
 		pruned,
 		elapsed_s: Math.round((Date.now() - start) / 10) / 100
 	};
+}
+
+/**
+ * Attach subtitle sidecars sitting next to each media file (subtitles.ts does the naming rules).
+ *
+ * Runs as its OWN pass over the indexed videos rather than inside the three parse paths, for one
+ * reason that matters in practice: subtitles arrive AFTER the video does. Bazarr fetches them hours
+ * later, people drop an .srt in by hand. Hanging discovery off the parse would mean an unchanged
+ * video is skipped by the incremental scan and its new subtitle never appears until a full rescan —
+ * i.e. exactly the case this feature exists for would silently not work.
+ *
+ * One readdir per distinct directory (cached — a season folder holds many episodes), and rows are
+ * only rewritten when the set actually changed, so a scan over a library with no new subtitles costs
+ * a directory listing and no writes.
+ */
+async function syncSubtitles(database: Database.Database): Promise<void> {
+	// peer_id IS NULL: mirrored federation rows are sync-owned and their paths aren't ours to read.
+	const videos = database
+		.prepare('SELECT id, video_path FROM videos WHERE peer_id IS NULL')
+		.all() as { id: string; video_path: string }[];
+	// This table holds SIDECAR FILES only, and the scan is its only writer — embedded tracks are
+	// resolved live at playback (subsembed.ts) rather than stored. The `stream_index IS NULL` filter
+	// stays as a belt-and-braces guard: when two writers briefly shared this table, this pass compared
+	// a video's full row set against the sidecars on disk, decided they differed, and deleted the lot,
+	// wiping every embedded track on each 5-minute rescan.
+	const stored = new Map<string, string[]>();
+	for (const r of database
+		.prepare('SELECT video_id, sub_path FROM video_subtitles WHERE stream_index IS NULL ORDER BY video_id, sub_path')
+		.all() as { video_id: string; sub_path: string }[]) {
+		(stored.get(r.video_id) ?? stored.set(r.video_id, []).get(r.video_id)!).push(r.sub_path);
+	}
+
+	const del = database.prepare('DELETE FROM video_subtitles WHERE video_id = ? AND stream_index IS NULL');
+	const ins = database.prepare(
+		'INSERT OR REPLACE INTO video_subtitles (video_id, lang, label, kind, forced, sub_path, ord) VALUES (?, ?, ?, ?, ?, ?, ?)'
+	);
+	const writeChunk = database.transaction(
+		(items: { id: string; tracks: { lang: string | null; label: string; kind: string; forced: boolean; path: string }[] }[]) => {
+			for (const it of items) {
+				del.run(it.id);
+				it.tracks.forEach((t, i) =>
+					ins.run(it.id, t.lang, t.label, t.kind, t.forced ? 1 : 0, t.path, i)
+				);
+			}
+		}
+	);
+
+	const dirCache = new Map<string, string[]>();
+	let pending: { id: string; tracks: ReturnType<typeof findSubtitles> }[] = [];
+	for (const v of videos) {
+		const relDir = path.dirname(v.video_path);
+		let entries = dirCache.get(relDir);
+		if (entries === undefined) {
+			try {
+				entries = await fsp.readdir(path.join(MEDIA_ROOT, relDir));
+			} catch {
+				entries = [];
+			}
+			dirCache.set(relDir, entries);
+		}
+		const tracks = findSubtitles(entries, path.basename(v.video_path)).map((t) => ({
+			...t,
+			path: relDir === '.' ? t.path : path.join(relDir, t.path)
+		}));
+		const before = (stored.get(v.id) ?? []).join('|');
+		const after = [...tracks.map((t) => t.path)].sort().join('|');
+		if (before === after) continue; // nothing changed for this video — don't touch the rows
+		pending.push({ id: v.id, tracks });
+		if (pending.length >= SUB_CHUNK) {
+			writeChunk(pending);
+			pending = [];
+			await tick();
+		}
+	}
+	if (pending.length) writeChunk(pending);
 }
 
 /** Immediate-child subdir names of a channels library that are themselves ANOTHER library's root, so

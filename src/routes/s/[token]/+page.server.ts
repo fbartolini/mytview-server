@@ -1,5 +1,6 @@
 import { getShare, shareLive, bumpShareUse } from '$lib/server/share';
 import { getVideo, directPlayMap, webPrefersCompat } from '$lib/server/queries';
+import { resolveTracks } from '$lib/server/subsembed';
 import { hlsEnabled } from '$lib/server/hls';
 import { signedHlsIndex } from '$lib/server/mediaToken';
 import { externalOrigin } from '$lib/server/origin';
@@ -61,9 +62,19 @@ export const load: PageServerLoad = async ({ params, cookies, url, request }) =>
 	// The full display detail for THIS video (parity with the regular page, minus related) —
 	// but never the server-side paths (video_path/info_path/mtime) or channel_id.
 	const hls = hlsEnabled();
+	// Subtitles for the recipient: a caption is part of the video, so a link that grants the stream
+	// grants its tracks — same rule /subs already enforced (shareGrantsMedia), just never handed out
+	// here until 2026-08-25. Carrying `?s=` makes each URL self-authorising for an account-less viewer.
+	const tracks = await resolveTracks(share.video_id);
 	return {
 		state: 'ok' as const,
 		token: share.token,
+		subtitles: tracks.map((t, i) => ({
+			lang: t.lang,
+			label: t.label,
+			kind: t.kind,
+			url: `/subs/${encodeURIComponent(share.video_id)}/${i}?s=${encodeURIComponent(share.token)}`
+		})),
 		// Live-HLS fallback for the recipient (no account): a SHORT-TTL signed capability URL for
 		// exactly this video — the same `?k=&exp=` mechanism native players use, so the auth hook
 		// already admits it. 2h (window-aligned → valid 2–4h): enough to watch, without outliving a

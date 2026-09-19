@@ -5,6 +5,7 @@ import { authLink, isGranted } from '$lib/server/fedserve';
 import { rateLimited } from '$lib/server/ratelimit';
 import { signedPath, signedHlsIndex } from '$lib/server/mediaToken';
 import { hlsEnabled } from '$lib/server/hls';
+import { resolveTracks } from '$lib/server/subsembed';
 import { linkTag, noteServe } from '$lib/server/fedmeter';
 import type { RequestHandler } from './$types';
 
@@ -33,9 +34,21 @@ export const POST: RequestHandler = async ({ request }) => {
 	// The link tag rides INSIDE the MAC (mediaToken.ts) — the media/HLS routes attribute + cap the
 	// resulting streams per peer (fedmeter.ts), and a mint ≈ one play start for the analytics.
 	noteServe(link.id, 'mint');
+	// Subtitles travel with the playback URLs rather than the catalog: they're resolved live from the
+	// sharer's own files (sidecars + container), so only the sharer can answer, and the consumer has
+	// no local copy of anything to inspect. Same signing as the media URL — the signature IS the
+	// credential, so /subs needs no link auth of its own.
+	const tracks = await resolveTracks(videoId);
+	const sig = signedPath('media', videoId, { tag: linkTag(link.id) }).replace(/^[^?]*/, '');
 	return json({
 		url: signedPath('media', videoId, { tag: linkTag(link.id) }),
 		hlsUrl: hlsEnabled() ? signedHlsIndex(videoId, 2 * 3600, linkTag(link.id)) : null,
-		ext: path.extname(row.video_path)
+		ext: path.extname(row.video_path),
+		subtitles: tracks.map((t, i) => ({
+			lang: t.lang,
+			label: t.label,
+			kind: t.kind,
+			url: `/subs/${encodeURIComponent(videoId)}/${i}${sig}`
+		}))
 	});
 };

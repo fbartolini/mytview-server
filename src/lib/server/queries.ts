@@ -105,6 +105,53 @@ export function libraryCounts(user: { id: number } | null): { videos: number; ch
 	return { videos, channels };
 }
 
+export type ContentKind = 'channel' | 'series' | 'movies';
+export interface ContentStats {
+	videos: number;
+	seconds: number;
+	federated: number;
+	byKind: Record<ContentKind, { channels: number; videos: number }>;
+}
+
+/** What's in the library, broken down by format — the About page's "what this server holds" panel.
+ *  Visibility-filtered like every other read, so each viewer is told the size of THEIR library, not
+ *  the owner's (a private channel must not leak even as a number). `seconds` sums the indexed
+ *  durations; items indexed without one (no sidecar duration) simply contribute 0. */
+export function contentStats(user: { id: number } | null): ContentStats {
+	const isKind = (k: string): k is ContentKind =>
+		k === 'channel' || k === 'series' || k === 'movies';
+	const byKind: ContentStats['byKind'] = {
+		channel: { channels: 0, videos: 0 },
+		series: { channels: 0, videos: 0 },
+		movies: { channels: 0, videos: 0 }
+	};
+	const chRows = db()
+		.prepare(
+			`SELECT kind, COUNT(*) AS c FROM channels WHERE ${visibilityClause(user, 'id')} GROUP BY kind`
+		)
+		.all() as { kind: string; c: number }[];
+	for (const r of chRows) if (isKind(r.kind)) byKind[r.kind].channels = r.c;
+
+	const vRows = db()
+		.prepare(
+			`SELECT c.kind AS kind, COUNT(*) AS c, COALESCE(SUM(v.duration), 0) AS secs,
+			        SUM(CASE WHEN v.peer_id IS NOT NULL THEN 1 ELSE 0 END) AS fed
+			 FROM videos v JOIN channels c ON c.id = v.channel_id
+			 WHERE ${visibilityClause(user, 'v.channel_id')} GROUP BY c.kind`
+		)
+		.all() as { kind: string; c: number; secs: number; fed: number }[];
+	let videos = 0;
+	let seconds = 0;
+	let federated = 0;
+	for (const r of vRows) {
+		videos += r.c;
+		seconds += r.secs;
+		federated += r.fed;
+		if (isKind(r.kind)) byKind[r.kind].videos = r.c;
+	}
+	return { videos, seconds, federated, byKind };
+}
+
 export function getChannel(
 	id: string,
 	userId: number,
@@ -496,4 +543,32 @@ export function getVideo(id: string): VideoDetail | null {
 	) as never;
 	v.chapters = v.chapters ? JSON.parse(v.chapters) : [];
 	return v as unknown as VideoDetail;
+}
+
+export interface SubtitleRow {
+	lang: string | null;
+	label: string;
+	kind: 'captions' | 'subtitles';
+	forced: boolean;
+	path: string;
+	/** NULL for a sidecar FILE; a stream index for a track embedded in the container. */
+	streamIndex: number | null;
+}
+
+/** Subtitle sidecars indexed for a video, in the server-decided display order — clients render this
+ *  order as given (contract §subtitles) so a menu reads the same on every platform. */
+export function subtitlesFor(videoId: string): SubtitleRow[] {
+	const rows = db()
+		.prepare(
+			'SELECT lang, label, kind, forced, sub_path, stream_index FROM video_subtitles WHERE video_id = ? ORDER BY ord'
+		)
+		.all(videoId) as { lang: string | null; label: string; kind: string; forced: number; sub_path: string; stream_index: number | null }[];
+	return rows.map((r) => ({
+		lang: r.lang,
+		label: r.label,
+		kind: r.kind === 'captions' ? 'captions' : 'subtitles',
+		forced: !!r.forced,
+		path: r.sub_path,
+		streamIndex: r.stream_index
+	}));
 }

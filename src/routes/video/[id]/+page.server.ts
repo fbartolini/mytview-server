@@ -1,5 +1,6 @@
 import { error } from '@sveltejs/kit';
 import { getVideo, relatedVideos, webPrefersCompat } from '$lib/server/queries';
+import { resolveTracks, audioTracksFor } from '$lib/server/subsembed';
 import { canSeeChannel } from '$lib/server/visibility';
 import { getWatch, watchedAtSeconds, resumePosition } from '$lib/server/watch';
 import { hlsEnabled } from '$lib/server/hls';
@@ -23,12 +24,16 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const remote = video.peer_id != null;
 	let srcUrl: string | null = null;
 	let fedHlsUrl: string | null = null;
+	// A federated video's subtitles come from the PEER (it alone can see the files); local ones are
+	// resolved below. Same field either way, so the player needs no idea which it got.
+	let fedSubtitles: { lang: string | null; label: string; kind: 'captions' | 'subtitles'; url: string }[] = [];
 	let peerUnavailable = false;
 	if (remote) {
 		try {
 			const abs = await fedPlaybackUrls(video.id);
 			srcUrl = abs.url;
 			fedHlsUrl = abs.hlsUrl;
+			fedSubtitles = abs.subtitles;
 		} catch {
 			peerUnavailable = true;
 		}
@@ -44,6 +49,10 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	// original plays — silent audio, but better than starting on a source that can't load).
 	const preferCompat = webPrefersCompat(params.id) && hls;
 	// Server-owned watch decisions so web + native seek/mark identically (see watch.ts).
+	// Sidecars + container tracks, resolved now (see subsembed.ts — a header read, memoised).
+	const tracks = remote ? [] : await resolveTracks(video.id);
+	const audio = remote ? [] : await audioTracksFor(video.id);
+
 	return {
 		video,
 		watch,
@@ -52,10 +61,21 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		hlsEnabled: hls,
 		srcUrl,
 		hlsUrl: fedHlsUrl,
+		// Subtitle sidecars (server-discovered, server-ordered). Same-origin here: the web player is
+		// already inside the auth guard, so no signature is needed the way native clients need one.
+		audioTracks: audio,
+		subtitles: remote
+			? fedSubtitles
+			: tracks.map((t, i) => ({
+					lang: t.lang,
+					label: t.label,
+					kind: t.kind,
+					url: `/subs/${encodeURIComponent(video.id)}/${i}`
+				})),
 		remote,
 		peerUnavailable,
 		watchedAt: watchedAtSeconds(video.duration),
 		resumePosition: resumePosition(watch, video.duration),
-		prefs: locals.user ? getUserPrefs(locals.user.id) : DEFAULT_PREFS
+		prefs: locals.user ? getUserPrefs(locals.user.id) : { ...DEFAULT_PREFS, browse: {} }
 	};
 };

@@ -50,6 +50,16 @@ RUN sed -i '/^Components:/ s/$/ non-free non-free-firmware/' /etc/apt/sources.li
 # Container path conventions (baked in so compose needn't repeat them; override via env if
 # you must). /media = read-only media library (bind-mounted); /data = writable home for
 # the disposable SQLite index; /transcodes = transcode output (bind a dir on your bulk array).
+# Build identity. The package version (0.4.x) changes a few times a year, so it cannot answer
+# "which build is this?" — the question you actually have when a deploy may or may not contain the
+# fix you just pushed. CI passes the commit it built from; local builds fall back to "dev".
+# ⚠️ Declared AFTER the heavy layers on purpose: these change on every commit, and putting them
+# earlier would bust the npm-install and build caches for a value nothing compiles against.
+ARG GIT_SHA=dev
+ARG BUILD_TIME=
+ENV MYTVIEW_GIT_SHA=$GIT_SHA
+ENV MYTVIEW_BUILD_TIME=$BUILD_TIME
+
 ENV MEDIA_ROOT=/media
 ENV DB_PATH=/data/index.db
 ENV TRANSCODE_DIR=/transcodes

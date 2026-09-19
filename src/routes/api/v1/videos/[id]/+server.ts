@@ -7,6 +7,7 @@ import { hlsEnabled } from '$lib/server/hls';
 import { fedPlaybackUrls, FedError } from '$lib/server/fedclient';
 import { fedIdParts, linkByPrefix } from '$lib/server/federation';
 import { runFedSync } from '$lib/server/fedsync';
+import { resolveTracks, audioTracksFor, prefersHlsForTextStreams } from '$lib/server/subsembed';
 import type { RequestHandler } from './$types';
 
 // Video detail for the player screen — one round-trip: full metadata (incl. tags + chapters), this
@@ -22,6 +23,9 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	// Codec residue OR a Matroska container — i.e. NOT every client can take the original as-is (an
 	// .mkv whose codec is fine still can't be demuxed by AVPlayer). Drives the `kind` hint below.
 	const compat = needsCompat(video.id);
+	// Sidecars + whatever is inside the container, asked now (a header read, memoised per file).
+	const tracks = await resolveTracks(video.id);
+	const audio = video.peer_id == null ? await audioTracksFor(video.id) : [];
 	const isVertical = !!video.width && !!video.height && video.height > video.width;
 	const poster = video.thumb_path ? signedPath('thumb', video.id) : null;
 
@@ -40,6 +44,20 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		mimeType: string;
 		poster: string | null;
 		canTranscode: boolean;
+		/** SERVER DECISION: start on `hlsUrl` instead of attempting `url` first. True when the
+		 *  container carries more embedded text streams than PREFER_HLS_TEXT_STREAMS — a silent
+		 *  demuxer failure on some panels that no client can detect (contract §playback descriptor,
+		 *  the same class as the web's webPrefersCompat). Absent/false = the normal fail-open ladder. */
+		preferHls: boolean;
+		/** Subtitle sidecars found next to the media file, in server-decided order — clients render
+		 *  as given. `kind: 'captions'` marks SDH/CC (the accessibility-relevant ones); the player
+		 *  should offer them and start with all tracks OFF unless the user chose otherwise. Empty
+		 *  array = none on disk (we never fetch or generate subtitles). */
+		subtitles: { lang: string | null; label: string; kind: 'captions' | 'subtitles'; url: string }[];
+		/** Audio tracks in the file. Choosing a non-default one means appending `&a=<index>` to
+		 *  `hlsUrl` — HTML5 video cannot switch audio inside a container, so the server delivers the
+		 *  chosen stream. `default:true` marks what plays when nobody chooses. */
+		audioTracks: { index: number; lang: string | null; label: string; default: boolean }[];
 	} = {
 		kind: !compat ? 'direct' : 'unavailable',
 		url: signedPath('media', video.id),
@@ -52,7 +70,17 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		hlsUrl: hlsEnabled() ? signedHlsIndex(video.id) : null,
 		mimeType: 'video/mp4',
 		poster,
-		canTranscode: false
+		canTranscode: false,
+		preferHls: hlsEnabled() && prefersHlsForTextStreams(tracks.filter((t) => t.streamIndex != null).length),
+		audioTracks: audio,
+		subtitles: tracks.map((t, i) => ({
+			lang: t.lang,
+			label: t.label,
+			kind: t.kind,
+			// Reuse the MEDIA signature: a subtitle belongs to the same asset, and /subs verifies the
+			// 'media' kind for exactly this id — so one grant covers the video and its captions.
+			url: `/subs/${encodeURIComponent(video.id)}/${i}${signedPath('media', video.id).replace(/^[^?]*/, '')}`
+		}))
 	};
 
 	// FEDERATED video: media streams DIRECT from the peer — the descriptor's url/hlsUrl become
@@ -65,6 +93,9 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 			const abs = await fedPlaybackUrls(video.id);
 			playback.url = abs.url;
 			playback.hlsUrl = abs.hlsUrl;
+			// The peer resolved these against ITS files; we have no local copy to inspect, so its
+			// answer is the only correct one. Absolute, like the media URL — clients pass both through.
+			playback.subtitles = abs.subtitles;
 		} catch (e) {
 			if (e instanceof FedError && e.kind === 'network') {
 				throw error(503, 'peer server unreachable');

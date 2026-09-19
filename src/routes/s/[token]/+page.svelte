@@ -160,7 +160,14 @@
 								? `/thumb/${encodeURIComponent(data.video.id)}?s=${encodeURIComponent(data.token)}`
 								: undefined}
 							{src}
-						></video>
+						>
+							<!-- Declared, never `default`: captions are the viewer's choice, driven by the
+							     browser's own CC control (⇔ Player.svelte). Each URL carries `?s=` so it
+							     authorises without an account. -->
+							{#each data.subtitles as t, i (t.url)}
+								<track kind={t.kind} label={t.label} srclang={t.lang ?? undefined} src={t.url} />
+							{/each}
+						</video>
 
 						{#if failed}
 							<div

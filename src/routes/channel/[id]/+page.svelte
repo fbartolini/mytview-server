@@ -23,7 +23,36 @@
 	});
 	// Movies wall genre filter — CLIENT-side over the delivered list (each movie carries its
 	// `genres`); the chip options come from the channel's aggregate. No refetch, no query param.
+	// Initial value = the library's SAVED filter (contract §Browse persistence); the effect
+	// re-applies it when navigation lands on a different wall with this component reused.
 	let genre = $state<string | null>(null);
+	$effect(() => {
+		genre = data.savedGenre ?? null;
+	});
+
+	// Write-through on every user change (§Browse persistence, keyed on the OWNING LIBRARY): the
+	// entry replaces the saved sort+genre whole; both at defaults → null clears it.
+	function persistBrowse(nextSort: string, nextGenre: string | null) {
+		if (!data.library || !isMovies) return;
+		const entry =
+			nextSort === 'title' && !nextGenre
+				? null
+				: {
+						...(nextSort !== 'title' ? { sort: nextSort } : {}),
+						...(nextGenre ? { genre: nextGenre } : {})
+					};
+		fetch('/api/v1/me', {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ browse: { [String(data.library.id)]: entry } }),
+			keepalive: true
+		}).catch(() => {});
+	}
+
+	function setGenre(g: string | null) {
+		genre = g;
+		persistBrowse(data.sort, g);
+	}
 	// "Show watched" is incremental: it ADDS watched videos to the unwatched ones (shows everything).
 	// The default view shows only unwatched, live-dropping a card the instant it's marked watched.
 	// Movies included since 2026-08-12 (the wall-is-the-collection exemption was reversed — the server
@@ -33,14 +62,19 @@
 			? data.videos
 			: data.videos.filter((v) => !($watchUpdates[v.id]?.watched ?? v.watched ?? false))
 	);
+	// A saved genre matching nothing here must not filter (⇔ /channels effectiveGenre): the stored
+	// pref stays, it just has no effect until it matches again.
+	const effectiveGenre = $derived(
+		isMovies && genre && (c.genres ?? []).includes(genre) ? genre : null
+	);
 	const shown = $derived(
-		isMovies && genre ? unwatchedLive.filter((v) => v.genres?.includes(genre!)) : unwatchedLive
+		effectiveGenre ? unwatchedLive.filter((v) => v.genres?.includes(effectiveGenre)) : unwatchedLive
 	);
 	// "Everything watched" in the default (unwatched-only) view — keyed off `shown` so it's right for
 	// channels (load returns only unwatched), series (load returns ALL episodes → filtered here), and
 	// the movies wall (load returns only unwatched; suppressed while a genre chip narrows the list).
 	const allWatched = $derived(
-		!data.showWatched && !(isMovies && genre) && c.video_count > 0 && shown.length === 0
+		!data.showWatched && !effectiveGenre && c.video_count > 0 && shown.length === 0
 	);
 	// Movies wall: how many the default view is hiding (video_count is the full collection size).
 	const hiddenWatched = $derived(
@@ -51,6 +85,7 @@
 	// wall reads as a sibling LIBRARY page, not a channel detail. 'title' is the default → drop the param.
 	function setMovieSort(e: Event) {
 		const value = (e.currentTarget as HTMLSelectElement).value;
+		persistBrowse(value, genre);
 		const url = new URL(page.url);
 		if (value === 'title') url.searchParams.delete('sort');
 		else url.searchParams.set('sort', value);
@@ -67,8 +102,9 @@
 	     art, which rendered as a large blank slab). -->
 	<div class="mb-5 flex items-baseline gap-3">
 		<h1 class="text-xl font-bold capitalize tracking-tight">{c.name}</h1>
+		<!-- The count is of what's ON SCREEN (contract §Browse controls) — a genre chip re-counts. -->
 		<span class="font-mono text-xs text-faint"
-			>{data.videos.length} movies{hiddenWatched > 0
+			>{shown.length} movies{hiddenWatched > 0
 				? ` · ${hiddenWatched} watched hidden`
 				: ''}</span
 		>
@@ -160,15 +196,17 @@
 {#if isMovies && (c.genres?.length ?? 0) > 0}
 	<div class="mb-4 flex flex-wrap gap-1.5">
 		<button
-			onclick={() => (genre = null)}
-			class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === null
+			onclick={() => setGenre(null)}
+			class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {effectiveGenre ===
+			null
 				? 'border-primary/60 text-primary'
 				: 'border-line text-muted hover:text-base-content'}">all</button
 		>
 		{#each c.genres ?? [] as g (g)}
 			<button
-				onclick={() => (genre = genre === g ? null : g)}
-				class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {genre === g
+				onclick={() => setGenre(effectiveGenre === g ? null : g)}
+				class="rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition-colors {effectiveGenre ===
+				g
 					? 'border-primary/60 text-primary'
 					: 'border-line text-muted hover:text-base-content'}">{g}</button
 			>
