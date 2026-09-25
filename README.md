@@ -16,7 +16,7 @@ this server over its [documented API](docs/api.md).
 - 📚 **Read-only** — your library is mounted `:ro`; MytView never writes to, moves, or deletes your files.
 - 👥 **Multi-user** — per-person sign-in, watch state, and resume points. Invite-based signup; the owner can reset passwords, deactivate, or remove accounts. Per-device session management with server-side revocation.
 - 🔦 **Per-channel privacy** — mark channels public or private and grant private ones to specific people, from a per-user × per-channel grid.
-- 📺 **Channels, series, and movies** — creator-channel libraries (`.info.json` sidecars), TV-series libraries (`.nfo` + `S01E02` naming, season/episode ordering, next-episode tracking), and movie libraries (Radarr/Kodi layout, a 2:3 poster wall with genre filters and sort). Libraries are configured in the UI, not env vars; fully-watched shows tidy themselves out of the grids until something new arrives.
+- 📺 **Channels, series, and movies** — creator-channel libraries (`.info.json` sidecars), TV-series libraries (`.nfo` + `S01E02` naming, season/episode ordering, next-episode tracking), and movie libraries (the Kodi layout media managers write, a 2:3 poster wall with genre filters and sort). Libraries are configured in the UI, not env vars; fully-watched shows tidy themselves out of the grids until something new arrives.
 - 🎞️ **Direct-play first, live HLS fallback** — every client tries the original file first; when it can't decode it, the server live-transcodes an ephemeral HLS stream that starts in seconds (VAAPI hardware encode when available, CPU fallback). Nothing is pre-transcoded or stored long-term.
 - 💬 **Subtitles & captions** — picked up from `.srt`/`.vtt` files next to the video *or* from text tracks inside the `.mkv`/`.mp4` itself, with SDH/CC marked as captions. Nothing is downloaded: what's on disk is what you get. **Image-based subtitles (PGS/VobSub) are not supported** — they're pictures of text and would need OCR or a burned-in re-encode; use a text (SRT) version instead.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
@@ -110,7 +110,7 @@ any subfolder of `/media` can be its own library:
   Falls back to `SxxExx` filename parsing when no `.nfo` exists.
 
 - **Movies** — `Movie Name (2024)/Movie Name (2024).mkv` with `movie.nfo` + `poster.jpg`/
-  `fanart.jpg` (the Radarr/Kodi layout). Rendered as a poster wall with genre filters and
+  `fanart.jpg` (the Kodi layout media managers write). Rendered as a poster wall with genre filters and
   title/year/recently-added sorting.
 
 Libraries are explicit: with none configured, nothing is indexed and the first-run screen walks
