@@ -21,6 +21,7 @@ this server over its [documented API](docs/api.md).
 - 💬 **Subtitles & captions** — picked up from `.srt`/`.vtt` files next to the video *or* from text tracks inside the `.mkv`/`.mp4` itself, with SDH/CC marked as captions. Nothing is downloaded: what's on disk is what you get. **Image-based subtitles (PGS/VobSub) are not supported** — they're pictures of text and would need OCR or a burned-in re-encode; use a text (SRT) version instead.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
 - 🌐 **Federation** — peer with **any number** of other MytView servers, sharing and consuming in both directions. Share different channels, shows, or whole libraries with each household; everything you consume merges into your own libraries (browse, search, and watch state stay on *your* server) while video streams flow **directly** from whichever server holds the file — plus per-peer concurrent-stream caps and consumption stats for the sharer.
+- 📲 **Offline on the phone** — the iPhone/iPad app (Android next) keeps movies and episodes on the device and follows a series for the next unwatched ones; the server hands out each copy in the format the device plays (H.264 and HEVC MKVs are remuxed, not re-encoded), paced by a negotiated session budget so a batch never crowds out someone watching live.
 - 🔄 **Plex sync** — two-way watched-state and resume-point sync with a Plex server on the same library. Each user links their own Plex account (plex.tv PIN flow); years of existing Plex history import on the first sync, and an unwatch in either app propagates to the other.
 
 Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
@@ -142,18 +143,16 @@ page; each user links their own Plex account there via plex.tv/link.
 The web UI ships with the server. The native apps (iPhone/iPad/Apple TV, Google TV,
 Samsung TV) are separate, closed-source products by the same author — the Samsung app is free.
 
-They're free during the beta and become a small one-time purchase (no subscription) later this
-year. **Install an app before 1 November 2026 and it stays free forever** — a founder licence,
-detected from the install date itself, with nothing to claim or register.
+They are free today and become a small one-time purchase (no subscription) from 1 November 2026.
+**Install an app before 1 November 2026 and it stays free forever** — a founder licence, detected
+from the install date itself, with nothing to claim or register.
 
-**Get the apps** — stores approve per device class, so availability differs by platform right now:
+**Get the apps:**
 
-- **Apple TV**: [on the App Store](https://apps.apple.com/app/id6790113115)
-- **iPhone / iPad**: in the last stage of App Store review — [join via TestFlight](https://testflight.apple.com/join/CsBAkfb9) meanwhile
-- **Android phone / tablet**: [open beta on Google Play](https://play.google.com/store/apps/details?id=com.mytview.app) —
-  anyone can install it, no invite needed
-- **Google TV**: built and working; Google reviews TV apps as a separate form factor, so it follows shortly
-- **Samsung TV**: free for everyone, lands on the Samsung store when review completes —
+- **iPhone / iPad / Apple TV**: [on the App Store](https://apps.apple.com/app/id6790113115) — the
+  offline-downloads release (1.2) is in review as of 2026-09-25
+- **Android phone / tablet / Google TV**: [on Google Play](https://play.google.com/store/apps/details?id=com.mytview.app)
+- **Samsung TV**: free for everyone, lands on the Samsung store when Samsung's review completes —
   [watch releases](https://github.com/fbartolini/mytview-server/releases) for the announcement
 
 Third-party clients are welcome: the full client contract — auth and device pairing, the
