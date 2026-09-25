@@ -2,7 +2,7 @@ import { error } from '@sveltejs/kit';
 import { db } from '$lib/server/db';
 import { verifyMedia } from '$lib/server/mediaToken';
 import { canSeeVideo } from '$lib/server/visibility';
-import { startHlsSession, hlsEnabled } from '$lib/server/hls';
+import { startHlsSession, hlsEnabled, HlsStorageError, HlsBusyError } from '$lib/server/hls';
 import { audioTracks } from '$lib/server/subsembed';
 import { linkIdFromTag, linkCap, streamAllowed, noteStream } from '$lib/server/fedmeter';
 import type { RequestHandler } from './$types';
@@ -47,8 +47,36 @@ export const GET: RequestHandler = async ({ params, url, locals, getClientAddres
 	// dropped, no encode. Not part of the signature (it grants nothing new); the engine refuses it
 	// silently — and encodes — for codecs TS can't carry or a keyframe scan still in progress.
 	const wantCopy = url.searchParams.get('mode') === 'copy';
-	const s = await startHlsSession(params.id, fedRef, audioIndex, wantCopy);
-	if (!s) throw error(404);
+	// ?copyv=h264[,hevc] narrows the copy allowlist to what this client plays in TS (contract §HLS).
+	const copyvRaw = url.searchParams.get('copyv');
+	const copyVideo = copyvRaw ? new Set(copyvRaw.split(',').map((v) => v.trim()).filter(Boolean)) : null;
+	// ?dl=1 marks a DOWNLOAD (contract §HLS): patient keyframe scan, no adaptive downscale.
+	const download = url.searchParams.get('dl') === '1';
+	// ?probe=1: a client asking "can this start now?" — no 20 s hold while a scan runs (contract §HLS).
+	const probe = url.searchParams.get('probe') === '1';
+	// ?fmt=fmp4: CMAF segments for a COPY — what Apple needs to take HEVC untouched (contract §HLS).
+	const fmp4 = url.searchParams.get('fmt') === 'fmp4';
+	let s: Awaited<ReturnType<typeof startHlsSession>>;
+	try {
+		s = await startHlsSession(params.id, fedRef, audioIndex, wantCopy, copyVideo, download, fmp4, probe);
+	} catch (e) {
+		// The transcode volume is full / unwritable: a service condition (503), logged once a minute by
+		// the engine — not the unexplained 500 + stack trace this used to be (production 2026-09-21).
+		if (e instanceof HlsStorageError) throw error(503, `transcode storage unavailable (${e.code})`);
+		// Every session slot in use: a WAIT the client queues on (Retry-After), never a 404 it reads as gone.
+		if (e instanceof HlsBusyError) {
+			if (download) console.warn(`[mytview] HLS: download playlist for ${params.id} deferred (${e.message}; retry in ${e.retryAfter} s)`);
+			return new Response('server busy', { status: 503, headers: { 'retry-after': String(e.retryAfter) } });
+		}
+		if (download) console.error(`[mytview] HLS: download playlist for ${params.id} failed: ${(e as Error).message}`);
+		throw e;
+	}
+	if (!s) {
+		// A download's client shows the status it got; say WHY here, or the log stays silent
+		// while every item on the phone reads "server busy" (owner field 2026-09-24).
+		if (download) console.warn(`[mytview] HLS: download playlist for ${params.id} refused (404: no session — unknown video, unreadable file or no duration)`);
+		throw error(404);
+	}
 	return new Response(s.playlist, {
 		headers: { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-store' }
 	});

@@ -557,6 +557,8 @@ export interface ScanStats {
 	channels: number;
 	videos: number;
 	indexed: number;
+	/** The video ids (re)parsed by this scan (targeted image prebake). */
+	indexedIds?: string[];
 	pruned: number;
 	/** Set when the empty-library safety valve fired: the walk saw 0 videos where the index holds
 	 *  some (suspected dead mount), so the prune was skipped. See scan(). */
@@ -588,6 +590,9 @@ interface ScanCtx {
 	markVideoSeen: Database.Statement; // durable dateAdded: INSERT OR IGNORE into state.videos_seen (seed = file mtime)
 	getVideoSeen: Database.Statement; // read the frozen first_seen_at back (ms)
 	counters: { indexed: number; processed: number };
+	/** Video ids (re)parsed THIS scan — the prebake warms only their art (a full 8k-source stat sweep
+	 *  after every 5-min scan was 50 s of NFS metadata I/O for 7 changed files; owner field 2026-09-24). */
+	indexedIds: Set<string>;
 	/** Called by the walkers at every batch boundary AND at each library's end: refreshes the
 	 *  library's channel `video_count`s (so nav tabs/visibility appear while the walk is still
 	 *  running — they're gated on video_count > 0) and publishes live ScanProgress. */
@@ -688,6 +693,7 @@ export async function scan(full = false): Promise<ScanStats> {
 	const seenVideos = new Set<string>();
 	const seenChannels = new Set<string>();
 	const counters = { indexed: 0, processed: 0 };
+	const indexedIds = new Set<string>();
 	// `IS ?` (not `= ?`) so the implicit default library (library_id NULL) matches too.
 	const refreshCounts = database.prepare(
 		'UPDATE channels SET video_count = ' +
@@ -711,6 +717,7 @@ export async function scan(full = false): Promise<ScanStats> {
 		markVideoSeen,
 		getVideoSeen,
 		counters,
+		indexedIds,
 		onBatch
 	};
 
@@ -760,6 +767,7 @@ export async function scan(full = false): Promise<ScanStats> {
 			channels: seenChannels.size,
 			videos: seenVideos.size,
 			indexed: ctx.counters.indexed,
+			indexedIds: [...ctx.indexedIds],
 			pruned: 0,
 			pruneSkipped: true,
 			elapsed_s: Math.round((Date.now() - start) / 10) / 100
@@ -806,6 +814,7 @@ export async function scan(full = false): Promise<ScanStats> {
 		channels: seenChannels.size,
 		videos: seenVideos.size,
 		indexed: ctx.counters.indexed,
+		indexedIds: [...ctx.indexedIds],
 		pruned,
 		elapsed_s: Math.round((Date.now() - start) / 10) / 100
 	};
@@ -970,6 +979,7 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
 						const vidId = String(info.id ?? base);
 						batch.push(buildVideoRow(info, vidId, cid, media, thumb, infoPath, mtime));
 						ctx.seenVideos.add(vidId);
+						ctx.indexedIds.add(vidId);
 						ctx.counters.indexed++;
 						foundAny = true;
 						enriched = true;
@@ -1081,6 +1091,7 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 				const id = meta?.tvdbId ? 'tvdb-' + meta.tvdbId : pathId(rel(media));
 				batch.push(buildEpisodeRow(meta, fname, id, seriesId, media, thumb, sidecar, mtime));
 				ctx.seenVideos.add(id);
+				ctx.indexedIds.add(id);
 				ctx.counters.indexed++;
 				foundAny = true;
 			}
@@ -1176,6 +1187,7 @@ async function indexMovies(lib: Library, ctx: ScanCtx): Promise<void> {
 			const addedSec = ((ctx.getVideoSeen.get(id) as { t: number } | undefined)?.t ?? mediaMtimeS * 1000) / 1000;
 			batch.push(buildMovieRow(meta, fname, id, chanId, media, addedSec, art, sidecar, mtime));
 			ctx.seenVideos.add(id);
+			ctx.indexedIds.add(id);
 			ctx.counters.indexed++;
 			foundAny = true;
 		}
@@ -1272,15 +1284,24 @@ export function noteExternalIndexChange(): void {
  *  and phone grids request) for everything indexed, SEQUENTIALLY through the bounded resize pipeline
  *  — so the warmer holds at most one slot and live requests always have capacity. Fire-and-forget
  *  after a scan that parsed anything; hits are single stat()s, failures fall back to originals. */
-async function warmImageCache(): Promise<void> {
+async function warmImageCache(onlyIds?: string[]): Promise<void> {
 	// Local rows only — fed rows carry 'fed:*' path sentinels with no MEDIA_ROOT file behind them
 	// (their art is cached by fedart.ts, which does its own warming on fetch).
-	const videos = db()
-		.prepare('SELECT thumb_path, poster_path FROM videos WHERE peer_id IS NULL')
-		.all() as { thumb_path: string | null; poster_path: string | null }[];
-	const channels = db()
-		.prepare('SELECT poster_path FROM channels WHERE peer_id IS NULL')
-		.all() as { poster_path: string | null }[];
+	// A routine scan warms ONLY the rows it (re)parsed; the full sweep (every source + every channel
+	// poster) runs for a big (re)index, where "changed" is most of the library anyway.
+	const targeted = onlyIds != null && onlyIds.length > 0 && onlyIds.length <= 200;
+	const videos = targeted
+		? (onlyIds!.map((id) =>
+				db().prepare('SELECT thumb_path, poster_path FROM videos WHERE id = ? AND peer_id IS NULL').get(id)
+			).filter(Boolean) as { thumb_path: string | null; poster_path: string | null }[])
+		: (db()
+				.prepare('SELECT thumb_path, poster_path FROM videos WHERE peer_id IS NULL')
+				.all() as { thumb_path: string | null; poster_path: string | null }[]);
+	const channels = targeted
+		? []
+		: (db()
+				.prepare('SELECT poster_path FROM channels WHERE peer_id IS NULL')
+				.all() as { poster_path: string | null }[]);
 	const jobs: [string | null, number][] = [
 		...videos.flatMap((v): [string | null, number][] => [[v.thumb_path, 480], [v.poster_path, 320]]),
 		...channels.map((c): [string | null, number] => [c.poster_path, 320])
@@ -1323,7 +1344,7 @@ export async function runScan(full = false): Promise<ScanStats | null> {
 		);
 		// Prebake image variants only when the scan actually (re)parsed something — an idle interval
 		// rescan (indexed 0) skips even the stat sweep.
-		if (_last.indexed > 0) void warmImageCache();
+		if (_last.indexed > 0) void warmImageCache(_last.indexedIds);
 		return _last;
 	} catch (e) {
 		_lastError = (e as Error).message;

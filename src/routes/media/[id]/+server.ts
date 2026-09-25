@@ -48,6 +48,17 @@ const handler: RequestHandler = async ({ params, request, url, cookies, locals, 
 			: stat.size;
 		noteServe(fedLink, 'media', bytes);
 	}
+	// `?dl=1` (contract §Offline): the same bytes with a download disposition, so a platform download
+	// engine (or a browser) saves the file under the library's own name instead of `<id>`. Not part
+	// of the signature — it grants nothing new. The name is the on-disk basename (RFC 5987-encoded,
+	// with an ASCII fallback); the byte range / HEAD / ETag behaviour is unchanged.
+	if (url.searchParams.get('dl') === '1') {
+		const base = r.video_path.split('/').pop() ?? params.id;
+		const ascii = base.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+		return serveFile(request, absPath, stat, {
+			'content-disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(base)}`
+		});
+	}
 	return serveFile(request, absPath, stat);
 };
 

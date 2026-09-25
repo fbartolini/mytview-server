@@ -14,7 +14,7 @@
  * spike/hls-spike.mjs.
  */
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { rm, unlink, readdir } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
@@ -22,6 +22,8 @@ import path from 'node:path';
 import {
 	HLS_DIR,
 	HLS_MAX_SESSIONS,
+	HLS_MAX_SESSIONS_EXPLICIT,
+	HLS_MAX_COPY_SESSIONS,
 	HLS_IDLE_SEC,
 	HLS_SESSION_TTL,
 	HLS_SEGMENT_SEC,
@@ -87,6 +89,14 @@ interface Session {
 	 *  Drives both the playlist's real durations and the restart-at-boundary math in ffmpegArgs. */
 	bounds: number[] | null;
 	reqCopy: boolean; // what the caller ASKED for (reuse key) — copy may be refused for an ineligible codec
+	/** A DOWNLOAD (contract §HLS `dl=1`): no start-latency to protect and no real-time to keep — waits
+	 *  for the keyframe scan instead of encoding, never downscales (a copy for the shelf keeps the
+	 *  source resolution however slow the host), never learns a "slow" rung for the file. */
+	download: boolean;
+	/** Copy sessions only: fMP4 (CMAF) segments + an init section instead of MPEG-TS — what Apple
+	 *  needs to take HEVC untouched (contract §HLS `fmt=fmp4`). Encodes always stay TS. */
+	fmp4: boolean;
+	vcodec: string | null;
 }
 
 // ---- STREAM-COPY mode --------------------------------------------------------------------------
@@ -110,6 +120,14 @@ const COPY_AUDIO = new Set(['aac', 'ac3', 'eac3', 'mp3']);
 const COPY_COARSE_SEEK = 20;
 const COPY_TRIM_LEAD = 0.5;
 const KEYFRAME_SCAN_BUDGET_MS = 4000; // wait this long for a first-time keyframe scan; beyond it, encode THIS session
+// A DOWNLOAD (contract §HLS: it sends `copyv`) has no start-latency to protect and its client counts
+// it against the COPY pool, so it waits for the scan rather than silently taking an encoder slot the
+// client never reserved (owner field 2026-09-23: the first session of every new file encoded, the
+// encoder pool overflowed, and the batch stalled on 503s).
+// ...but never longer than a reverse proxy waits (30–60 s is the usual read timeout — a 60 s wait
+// came back to the app as a 504 from the owner's proxy, 2026-09-23): 20 s, then 503 + Retry-After
+// while the scan finishes in the background (memoised), and the next attempt copies.
+const KEYFRAME_SCAN_BUDGET_PATIENT_MS = 20_000;
 
 /** Copy-mode segment start times from a keyframe list: every keyframe at least `seg` after the previous
  *  start — ffmpeg's own cutting rule for a copied stream, so the playlist and the files agree. */
@@ -128,9 +146,46 @@ export function copyBoundaries(keyframes: number[], seg = SEG): number[] {
 type KeyScan = { keys: number[]; end: number };
 const keyframeCache = new Map<string, KeyScan | null>();
 const keyframeScans = new Map<string, Promise<KeyScan | null>>();
+// The scan reads the WHOLE file (minutes for a 4 GB source over NFS), so its result is kept ON DISK
+// beside the transcode dir, keyed by path+mtime: a restart/redeploy used to forget every scan and
+// every mid-download task then sat on 503s while the same files were scanned again (owner field
+// 2026-09-24). Tiny JSON files; a source that changes (new mtime) simply gets a new key.
+const keyframeDir = (): string | null => (HLS_DIR ? path.join(path.dirname(HLS_DIR), 'keyframes') : null);
+function keyframeFile(key: string): string | null {
+	const dir = keyframeDir();
+	return dir ? path.join(dir, crypto.createHash('sha1').update(key).digest('hex') + '.json') : null;
+}
+function readKeyframes(key: string): KeyScan | null | undefined {
+	const f = keyframeFile(key);
+	if (!f || !existsSync(f)) return undefined;
+	try {
+		const v = JSON.parse(readFileSync(f, 'utf8')) as { keys?: number[]; end?: number } | null;
+		if (v == null) return null;
+		return Array.isArray(v.keys) && typeof v.end === 'number' ? { keys: v.keys, end: v.end } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+function writeKeyframes(key: string, r: KeyScan | null): void {
+	const f = keyframeFile(key);
+	if (!f) return;
+	try {
+		mkdirSync(path.dirname(f), { recursive: true });
+		writeFileSync(f + '.tmp', JSON.stringify(r));
+		renameSync(f + '.tmp', f);
+	} catch {
+		/* best effort: the in-memory memo still holds it for this process */
+	}
+}
 function scanKeyframes(abs: string, key: string): Promise<KeyScan | null> {
 	const cached = keyframeCache.get(key);
 	if (cached !== undefined) return Promise.resolve(cached);
+	const onDisk = readKeyframes(key);
+	if (onDisk !== undefined) {
+		if (keyframeCache.size >= PROBE_CACHE_MAX) keyframeCache.clear();
+		keyframeCache.set(key, onDisk);
+		return Promise.resolve(onDisk);
+	}
 	let p = keyframeScans.get(key);
 	if (!p) {
 		p = execFileP(
@@ -157,6 +212,7 @@ function scanKeyframes(abs: string, key: string): Promise<KeyScan | null> {
 				if (keyframeCache.size >= PROBE_CACHE_MAX) keyframeCache.clear();
 				keyframeCache.set(key, r);
 				keyframeScans.delete(key);
+				writeKeyframes(key, r);
 				return r;
 			});
 		keyframeScans.set(key, p);
@@ -180,6 +236,15 @@ async function probeAudioCodecs(abs: string): Promise<Map<number, string>> {
 	}
 	return out;
 }
+/** The transcode volume refused a session dir (ENOSPC / EROFS / EACCES / ENOENT) — the playlist
+ *  route turns this into a 503 with the code, so a client (and the operator) can tell it apart from
+ *  "no such video". */
+export class HlsStorageError extends Error {
+	constructor(public readonly code: string) {
+		super(`HLS storage unavailable: ${code}`);
+	}
+}
+let lastStorageWarn = 0;
 const sessions = new Map<string, Session>();
 let hwDisabled = false; // set once VAAPI proves unusable on this host → CPU from then on
 let tonemapDisabled = false; // set once the HDR tonemap proves unrunnable (no libzimg / bad primaries) → plain 8-bit
@@ -187,8 +252,10 @@ let gpuTonemapDisabled = false; // set once tonemap_vaapi fails a real encode �
 let gcStarted = false;
 let sweepPromise: Promise<void> | null = null; // shared one-time boot sweep (memoized so concurrent callers await the SAME completion)
 
-const segName = (n: number) => `seg${String(n).padStart(5, '0')}.ts`;
-const segPath = (s: Session, n: number) => path.join(s.dir, segName(n));
+const segName = (s: Session, n: number) => `seg${String(n).padStart(5, '0')}.${s.fmp4 ? 'm4s' : 'ts'}`;
+const segPath = (s: Session, n: number) => path.join(s.dir, segName(s, n));
+const INIT_NAME = 'init.mp4';
+const initPath = (s: Session) => path.join(s.dir, INIT_NAME);
 
 async function probeDuration(abs: string): Promise<number | null> {
 	try {
@@ -327,6 +394,54 @@ function sweepOrphans(): Promise<void> {
 // index.m3u8 GET, and players routinely fetch a VOD playlist 2–4× at playback start (Safari), so a
 // single play could spawn 8 probe processes and a scripted loop unbounded ones. Bounded by wholesale
 // clear (simplest; refilling costs one probe pair per file on next play).
+/** The file's streams, probed once per (path, mtime) and shared by session start and the
+ *  descriptor's copy-eligibility answer. */
+async function probeFile(srcAbs: string, cacheKey: string) {
+	let probed = probeCache.get(cacheKey);
+	if (!probed) {
+		probed = {
+			duration: await probeDuration(srcAbs),
+			...(await probeVideo(srcAbs)),
+			audio: await probeDefaultAudio(srcAbs),
+			acodecs: await probeAudioCodecs(srcAbs)
+		};
+		if (probeCache.size >= PROBE_CACHE_MAX) probeCache.clear();
+		probeCache.set(cacheKey, probed);
+	}
+	return probed;
+}
+
+/** Would `?mode=copy` (narrowed by `copyVideo`, contract §HLS `copyv`) copy this file's DEFAULT track
+ *  pair, or encode it? The descriptor's `playback.hlsCopy` — decided on the REAL probe, not the
+ *  catalog's codec fields (an NFO without <streamdetails> says nothing; a wrong one would misroute).
+ *  Memoised with the session probe, so the second ask is free. false when HLS is off or unprobeable. */
+export async function copyEligible(videoId: string, copyVideo: Set<string> | null): Promise<boolean> {
+	if (!HLS_DIR) return false;
+	const row = db().prepare('SELECT video_path FROM videos WHERE id = ?').get(videoId) as
+		| { video_path: string }
+		| undefined;
+	if (!row) return false;
+	let srcAbs: string;
+	let mtimeMs: number;
+	try {
+		const r = await resolveInMediaRoot(row.video_path);
+		srcAbs = r.absPath;
+		mtimeMs = r.stat.mtimeMs;
+	} catch {
+		return false;
+	}
+	const p = await probeFile(srcAbs, `${srcAbs}:${mtimeMs}`);
+	const aIdx = p.audio ?? [...p.acodecs.keys()][0];
+	const acodec = aIdx != null ? p.acodecs.get(aIdx) : undefined;
+	return !!(
+		p.vcodec &&
+		COPY_VIDEO.has(p.vcodec) &&
+		(copyVideo == null || copyVideo.has(p.vcodec)) &&
+		acodec &&
+		COPY_AUDIO.has(acodec)
+	);
+}
+
 const probeCache = new Map<
 	string,
 	{
@@ -345,7 +460,27 @@ const PROBE_CACHE_MAX = 512;
 // Bound TOTAL session entries (temp dirs + Map rows). HLS_MAX_SESSIONS caps concurrent ENCODERS at
 // segment time, but nothing capped playlist-time minting — sessions are retained HLS_SESSION_TTL
 // (30 min), so a playlist flood accumulated dirs and Map entries freely.
-const MAX_TOTAL_SESSIONS = HLS_MAX_SESSIONS * 4;
+const MAX_TOTAL_SESSIONS = (HLS_MAX_SESSIONS + HLS_MAX_COPY_SESSIONS) * 4;
+
+/** Thrown when every session slot is genuinely in use: the route answers 503 + Retry-After (a WAIT),
+ *  never the 404 that a client reads as "gone" (owner field 2026-09-23: a batch of downloads filled
+ *  the table and the rest failed with CoreMedia -12884 instead of queueing). */
+export class HlsBusyError extends Error {
+	/** How long the client should wait before asking again (the route's Retry-After). */
+	readonly retryAfter: number;
+	constructor(reason: 'table full' | 'keyframe scan running', retryAfter = 30) {
+		super(reason === 'table full' ? 'hls: every session slot is in use' : 'hls: keyframe scan still running for this file');
+		this.retryAfter = retryAfter;
+	}
+}
+
+/** A DOWNLOAD session whose every segment has been fetched and whose ffmpeg is gone: nothing will ask
+ *  it for anything again, so it is the first thing to reclaim when the table is full. */
+function isFinishedDownload(s: Session): boolean {
+	if (!s.download || s.active) return false;
+	const last = s.bounds ? s.bounds.length - 1 : Math.ceil(s.duration / SEG) - 1;
+	return s.everFetched && s.lastFetched >= last;
+}
 
 /**
  * What the live transcoder can actually do ON THIS HOST — the About page's playback report.
@@ -363,6 +498,9 @@ export function hlsStatus(): {
 	encoding: number;
 	sessions: number;
 	maxEncoders: number;
+	/** Stream-copy sessions running (their own pool — no encoder involved) and that pool's cap. */
+	copying: number;
+	maxCopies: number;
 } {
 	const device = existsSync(VAAPI_DEVICE);
 	return {
@@ -371,7 +509,9 @@ export function hlsStatus(): {
 		device,
 		encoding: activeCount(),
 		sessions: sessions.size,
-		maxEncoders: HLS_MAX_SESSIONS
+		maxEncoders: maxEncoders(),
+		copying: copyCount(),
+		maxCopies: HLS_MAX_COPY_SESSIONS
 	};
 }
 
@@ -393,7 +533,30 @@ export async function startHlsSession(
 	videoId: string,
 	fed: { linkId: number; key: string } | null = null,
 	audioIndex: number | null = null,
-	wantCopy = false
+	wantCopy = false,
+	copyVideo: Set<string> | null = null,
+	download = false,
+	/** fMP4 segments for a COPY (contract §HLS `fmt=fmp4`): HEVC rides untouched for Apple. */
+	fmp4 = false,
+	/** A client PROBE (`probe=1`): answer at once — 503 while the keyframe scan runs, never a 20 s hold —
+	 *  so a queue can ask about many files in parallel without serialising on the waits. */
+	probe = false
+): Promise<{ sid: string; playlist: string } | null> {
+	return startHlsSessionImpl(videoId, fed, audioIndex, wantCopy, copyVideo, download, fmp4, probe);
+}
+
+async function startHlsSessionImpl(
+	videoId: string,
+	fed: { linkId: number; key: string } | null,
+	audioIndex: number | null,
+	wantCopy: boolean,
+	/** Narrow the copy allowlist to what THIS client's demuxer takes in TS (contract §HLS `copyv`):
+	 *  Apple plays H.264 in TS but HEVC only in fMP4, so an Apple download asks `copyv=h264` and an
+	 *  HEVC source is ENCODED rather than copied into something AVPlayer refuses. null = engine default. */
+	copyVideo: Set<string> | null,
+	download: boolean,
+	fmp4: boolean,
+	probe = false
 ): Promise<{ sid: string; playlist: string } | null> {
 	if (!HLS_DIR) return null;
 	// Playlist refetch collapse: reuse a just-minted session for the same video that nobody has pulled
@@ -409,6 +572,8 @@ export async function startHlsSession(
 			s.videoId === videoId &&
 			s.reqAudio === audioIndex &&
 			s.reqCopy === wantCopy && // a copy playlist and an encode playlist address DIFFERENT segments
+			s.download === download &&
+			s.fmp4 === (fmp4 && s.copy) &&
 			!s.everFetched &&
 			Date.now() - s.createdAt < 20_000
 		) {
@@ -434,17 +599,7 @@ export async function startHlsSession(
 	// that 404/time-out. Fall back to the indexed duration only if ffprobe can't read it. Cached per (path,
 	// mtime) — see probeCache.
 	const cacheKey = `${srcAbs}:${mtimeMs}`;
-	let probed = probeCache.get(cacheKey);
-	if (!probed) {
-		probed = {
-			duration: await probeDuration(srcAbs),
-			...(await probeVideo(srcAbs)),
-			audio: await probeDefaultAudio(srcAbs),
-			acodecs: await probeAudioCodecs(srcAbs)
-		};
-		if (probeCache.size >= PROBE_CACHE_MAX) probeCache.clear();
-		probeCache.set(cacheKey, probed);
-	}
+	const probed = await probeFile(srcAbs, cacheKey);
 	const duration = probed.duration ?? (row.duration && row.duration > 0 ? row.duration : null);
 	if (!duration) return null;
 	const hdr = probed.hdr;
@@ -454,16 +609,24 @@ export async function startHlsSession(
 	if (wantCopy) {
 		const aIdx = audioIndex ?? probed.audio ?? [...probed.acodecs.keys()][0];
 		const acodec = aIdx != null ? probed.acodecs.get(aIdx) : undefined;
-		if (probed.vcodec && COPY_VIDEO.has(probed.vcodec) && acodec && COPY_AUDIO.has(acodec)) {
+		const vOk = probed.vcodec && COPY_VIDEO.has(probed.vcodec) && (copyVideo == null || copyVideo.has(probed.vcodec));
+		if (vOk && acodec && COPY_AUDIO.has(acodec)) {
 			const scan = await Promise.race([
 				scanKeyframes(srcAbs, cacheKey),
-				new Promise<undefined>((r) => setTimeout(r, KEYFRAME_SCAN_BUDGET_MS))
+				new Promise<undefined>((r) =>
+					setTimeout(r, probe ? 0 : download ? KEYFRAME_SCAN_BUDGET_PATIENT_MS : KEYFRAME_SCAN_BUDGET_MS)
+				)
 			]);
 			if (scan) {
 				// The playlist must end where the DATA ends, not where the header claims it does.
 				copyEnd = Math.min(duration, scan.end + 0.1);
 				const inRange = scan.keys.filter((t) => t < copyEnd);
 				bounds = inRange.length ? copyBoundaries(inRange) : null;
+			} else if (download) {
+				// A download would rather come back in a moment than take an encoder slot its client
+				// never reserved: say WAIT, the scan keeps running (memoised; a 4 GB file over NFS can
+				// take minutes the first time).
+				throw new HlsBusyError('keyframe scan running', 20);
 			}
 		}
 	}
@@ -471,8 +634,14 @@ export async function startHlsSession(
 	// session is genuinely being watched, refuse — the route 404s and the client retries/fails soft.
 	if (sessions.size >= MAX_TOTAL_SESSIONS) {
 		let victim: Session | null = null;
+		// Finished downloads first: they hold a slot for the TTL though nothing will ever fetch again.
 		for (const s of sessions.values()) {
-			if (!s.everFetched && (!victim || s.createdAt < victim.createdAt)) victim = s;
+			if (isFinishedDownload(s) && (!victim || s.lastAccess < victim.lastAccess)) victim = s;
+		}
+		if (!victim) {
+			for (const s of sessions.values()) {
+				if (!s.everFetched && (!victim || s.createdAt < victim.createdAt)) victim = s;
+			}
 		}
 		// Nothing never-fetched → reclaim the longest-IDLE fetched one, if it's past the encoder reap. Those
 		// are abandoned retries/switches that TTL (30 min) would otherwise pin, 404-ing every new playlist
@@ -484,22 +653,42 @@ export async function startHlsSession(
 				if (s.lastAccess < idleBefore && (!victim || s.lastAccess < victim.lastAccess)) victim = s;
 			}
 		}
-		if (!victim) return null;
+		if (!victim) throw new HlsBusyError('table full'); // every slot genuinely in use → the route says WAIT (503)
 		destroySession(victim);
 		sessions.delete(victim.id);
 	}
 	if (!existsSync(HLS_DIR)) mkdirSync(HLS_DIR, { recursive: true });
 	await sweepOrphans(); // before mkdtemp, so we never delete the dir we're about to create
 	const sid = crypto.randomBytes(16).toString('hex');
-	const dir = mkdtempSync(path.join(HLS_DIR, 'sess-'));
+	let dir: string;
+	try {
+		dir = mkdtempSync(path.join(HLS_DIR, 'sess-'));
+	} catch (e) {
+		// A full / read-only / missing transcode volume is an OPERATOR problem, not a bug in this
+		// request: say so once per minute in the log and let the route answer 503, not a stack trace.
+		const code = (e as NodeJS.ErrnoException).code ?? 'error';
+		if (Date.now() - lastStorageWarn > 60_000) {
+			lastStorageWarn = Date.now();
+			console.error(
+				`[mytview] HLS: cannot create a session dir in ${HLS_DIR} (${code}) — ` +
+					`check the transcode volume's space and permissions; every HLS start fails until it is fixed`
+			);
+		}
+		throw new HlsStorageError(code);
+	}
 	sessions.set(sid, {
 		// An explicitly CHOSEN track wins over the file's default. Validated by the caller against the
 		// file's real streams, so this can only ever be one of them.
 		id: sid, videoId, srcAbs, dir, duration: bounds ? copyEnd : duration, audio: audioIndex ?? probed.audio, reqAudio: audioIndex,
 		active: null, createdAt: Date.now(), lastAccess: Date.now(), lastFetched: 0, everFetched: false,
 		fed, frontier: 0, paused: false, hdr, pq: probed.pq, width: probed.width, height: probed.height,
-		probeKey: cacheKey, scaleStep: slowSources.get(cacheKey) ?? 0,
-		copy: bounds != null, bounds, reqCopy: wantCopy
+		// A download ENCODE (never a copy — copies are untouched bytes) tops out at the 1080p box: on a
+		// phone or tablet nothing above it is visible, a 4K encode on a home CPU runs at a fraction of
+		// real time, and the copy would take hours (owner 2026-09-24). Sources at or under 1080p keep
+		// their size; playback keeps the source resolution until the host proves it can't keep up.
+		probeKey: cacheKey, scaleStep: download ? (scaledSize(probed.width, probed.height, 1) ? 1 : 0) : (slowSources.get(cacheKey) ?? 0),
+		copy: bounds != null, bounds, reqCopy: wantCopy, download,
+		fmp4: bounds != null && fmp4, vcodec: probed.vcodec
 	});
 	startGc();
 	return { sid, playlist: buildPlaylist(sessions.get(sid)!) };
@@ -515,9 +704,11 @@ function buildPlaylist(s: Session): string {
 		const b = s.bounds;
 		const durs = b.map((t, i) => (i < b.length - 1 ? b[i + 1] - t : Math.max(0.1, s.duration - t)));
 		const target = Math.ceil(Math.max(...durs));
-		let m = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${target}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
+		let m = s.fmp4
+			? `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${target}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI="/hls/s/${s.id}/${INIT_NAME}?${sig}"\n`
+			: `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${target}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
 		durs.forEach((d, i) => {
-			m += `#EXTINF:${d.toFixed(6)},\n/hls/s/${s.id}/${segName(i)}?${sig}\n`;
+			m += `#EXTINF:${d.toFixed(6)},\n/hls/s/${s.id}/${segName(s, i)}?${sig}\n`;
 		});
 		return m + '#EXT-X-ENDLIST\n';
 	}
@@ -525,7 +716,7 @@ function buildPlaylist(s: Session): string {
 	let m = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${SEG}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
 	for (let i = 0; i < n; i++) {
 		const dur = i < n - 1 ? SEG : s.duration - (n - 1) * SEG;
-		m += `#EXTINF:${dur.toFixed(6)},\n/hls/s/${s.id}/${segName(i)}?${sig}\n`;
+		m += `#EXTINF:${dur.toFixed(6)},\n/hls/s/${s.id}/${segName(s, i)}?${sig}\n`;
 	}
 	return m + '#EXT-X-ENDLIST\n';
 }
@@ -536,6 +727,18 @@ function buildPlaylist(s: Session): string {
 /** The federation attribution (if any) of a live session — for the segment route's metering. */
 export function hlsSessionFed(sid: string): { linkId: number; key: string } | null {
 	return sessions.get(sid)?.fed ?? null;
+}
+
+/** The fMP4 init section of a copy session (ensures the from-zero run has started, waits for the
+ *  file). null for a TS session, an unknown session, or a timeout. */
+export async function hlsInit(sid: string): Promise<string | null> {
+	const s = sessions.get(sid);
+	if (!s || !s.fmp4) return null;
+	s.lastAccess = Date.now();
+	s.everFetched = true;
+	if (!ensureCovers(s, s.lastFetched)) return null;
+	if (!(await waitFor(initPath(s), 45000))) return null;
+	return initPath(s);
 }
 
 export async function hlsSegment(sid: string, n: number): Promise<string | null> {
@@ -565,11 +768,24 @@ function frontier(s: Session): number {
 	s.frontier = k;
 	return k;
 }
+/** The encoder cap in force: the owner's explicit HLS_MAX_SESSIONS, else 6 while the hardware encoder
+ *  is really usable and 3 the moment it is not (VAAPI disproved, or the render node absent). */
+function maxEncoders(): number {
+	if (HLS_MAX_SESSIONS_EXPLICIT) return HLS_MAX_SESSIONS;
+	return TRANSCODE_HWACCEL && !hwDisabled && existsSync(VAAPI_DEVICE) ? 6 : 3;
+}
+
 function activeCount(): number {
-	// Count only encoders actually USING the CPU — a throttle-frozen (SIGSTOP'd) session isn't, so it must not
-	// pin a concurrency slot against a genuinely new stream.
+	// Count only ENCODERS actually using the CPU — a throttle-frozen (SIGSTOP'd) session isn't, so it must not
+	// pin a concurrency slot against a genuinely new stream; a stream COPY has no encoder (own pool below).
 	let c = 0;
-	for (const s of sessions.values()) if (s.active && !s.paused) c++;
+	for (const s of sessions.values()) if (s.active && !s.paused && !s.copy) c++;
+	return c;
+}
+
+function copyCount(): number {
+	let c = 0;
+	for (const s of sessions.values()) if (s.active && !s.paused && s.copy) c++;
 	return c;
 }
 
@@ -588,7 +804,8 @@ function ensureCovers(s: Session, n: number): boolean {
 		const f = frontier(s);
 		if (n >= f && n - f < CATCHUP) return true; // the active job will reach it soon (normal buffering)
 	}
-	if (!s.active && activeCount() >= HLS_MAX_SESSIONS) return false; // a home box only serves a few streams
+	// A home box only serves a few ENCODES; copies are near-free and have their own, larger pool.
+	if (!s.active && (s.copy ? copyCount() >= HLS_MAX_COPY_SESSIONS : activeCount() >= maxEncoders())) return false;
 	spawnAt(s, n); // a real seek (or first play) → (re)start the encode here
 	return true;
 }
@@ -596,7 +813,14 @@ function ensureCovers(s: Session, n: number): boolean {
 /** One -progress sample for `job` (media seconds encoded so far). Takes a baseline at the first frame, then
  *  after SPEED_WINDOW_MS judges the steady-state speed ONCE per job — too slow → one rung down, at the frontier. */
 function onProgress(s: Session, job: NonNullable<Session['active']>, out: number) {
-	if (s.copy) return; // nothing to downscale — a copy runs at I/O speed, and there is no encoder to slow
+	// A copy has no encoder to slow down — but it runs at DISK speed, so the 5s GC tick alone let it dump
+	// a whole episode into segments before the first freeze (a 500 MB file copies in seconds; the
+	// transcode volume filled up and every HLS start 500'd with ENOSPC — production 2026-09-21).
+	// Throttle on every progress sample instead (the copy job reports every 100 ms).
+	if (s.copy) {
+		throttle(s);
+		return;
+	}
 	if (job.done || s.active !== job || s.paused) return;
 	const now = Date.now();
 	if (!job.speed) {
@@ -605,6 +829,7 @@ function onProgress(s: Session, job: NonNullable<Session['active']>, out: number
 	}
 	if (now - job.speed.wall < SPEED_WINDOW_MS) return;
 	job.done = true;
+	if (s.download) return; // a copy for the shelf keeps the source resolution, however slow the host
 	const speed = (out - job.speed.out) / ((now - job.speed.wall) / 1000);
 	if (speed >= HLS_MIN_SPEED) return;
 	const step = nextScaleStep(s);
@@ -690,13 +915,18 @@ function ffmpegArgs(s: Session, start: number): string[] {
 			: { pre: [], post: [] };
 		return [
 			'-nostdin', '-y',
-			'-nostats', '-progress', 'pipe:1', // the ahead-throttle still reads the frontier; nothing measures speed
+			// The ahead-throttle runs off THIS feed for a copy (see onProgress): a fine period keeps the
+			// burst between freezes to ~100 ms of disk writes, not the 5 s GC tick.
+			'-nostats', '-progress', 'pipe:1', '-stats_period', '0.1',
 			...seek.pre, '-i', s.srcAbs, ...seek.post,
 			'-map', '0:V:0', '-map', s.audio != null ? `0:${s.audio}` : '0:a:0?',
 			'-c', 'copy', '-sn', '-dn', // text + data tracks dropped: the demuxer relief this mode exists for
+			// fMP4: Apple takes HEVC in HLS only as CMAF, and only tagged `hvc1` (not ffmpeg's default `hev1`).
+			...(s.fmp4 && s.vcodec === 'hevc' ? ['-tag:v', 'hvc1'] : []),
 			'-f', 'hls', '-hls_time', String(SEG), '-hls_list_size', '0', '-start_number', String(start),
 			'-hls_flags', 'temp_file',
-			'-hls_segment_filename', path.join(s.dir, 'seg%05d.ts'),
+			...(s.fmp4 ? ['-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', INIT_NAME] : []),
+			'-hls_segment_filename', path.join(s.dir, `seg%05d.${s.fmp4 ? 'm4s' : 'ts'}`),
 			path.join(s.dir, 'ff.m3u8')
 		];
 	}

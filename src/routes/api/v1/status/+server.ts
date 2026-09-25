@@ -1,7 +1,7 @@
 import { error, json } from '@sveltejs/kit';
 import { scanStatus } from '$lib/server/indexer';
 import { libraryCounts } from '$lib/server/queries';
-import { hlsEnabled } from '$lib/server/hls';
+import { hlsEnabled, hlsStatus } from '$lib/server/hls';
 import { BUILD_SHA, SERVER_VERSION } from '$lib/server/config';
 import type { RequestHandler } from './$types';
 
@@ -12,7 +12,24 @@ export const GET: RequestHandler = ({ locals }) => {
 	if (!locals.user) throw error(401);
 	const s = scanStatus();
 	const { videos, channels } = libraryCounts(locals.user);
+	const h = hlsStatus();
 	return json({
+		// Live-transcode capacity (contract §status, additive 0.4.8): an offline download of an HLS
+		// rendition IS a transcode session, so a client sizes its download queue from
+		// `downloadSlots` — the cap minus one session the server keeps for someone watching live —
+		// instead of guessing and eating 503s. `active` = encoders running right now.
+		hls: h.enabled
+			? {
+					maxSessions: h.maxEncoders,
+					active: h.encoding,
+					downloadSlots: Math.max(1, h.maxEncoders - 1),
+					// Stream-copy pool (a remux, no encoder): a download the descriptor marks `hlsCopy`
+					// counts here, not against the encoder slots — a batch of H.264 MKVs remuxes in parallel.
+					maxCopies: h.maxCopies,
+					copying: h.copying,
+					copySlots: Math.max(1, h.maxCopies - 1)
+				}
+			: null,
 		scanning: s.scanning,
 		everScanned: s.everScanned,
 		error: s.error,

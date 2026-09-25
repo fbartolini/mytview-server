@@ -120,7 +120,10 @@ export const handle: Handle = async ({ event, resolve }) => {
 			// unguessable capability, handed out only by an already-authed index.m3u8.
 			const h =
 				pathname.match(/^\/hls\/v\/([^/]+)\/index\.m3u8$/) ??
-				pathname.match(/^\/hls\/s\/([^/]+)\/seg\d+\.ts$/);
+				// TS or fMP4 segments, and the fMP4 init section (contract §HLS `fmt=fmp4`) — the gate
+				// matched only `.ts` when fMP4 shipped, so every init.mp4/.m4s answered 401 and AVFoundation
+				// reported the playlist as broken (owner field 2026-09-24).
+				pathname.match(/^\/hls\/s\/([^/]+)\/(?:seg\d+\.(?:ts|m4s)|init\.mp4)$/);
 			if (h) {
 				let id: string | null = null;
 				try {

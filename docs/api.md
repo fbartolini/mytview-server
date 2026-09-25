@@ -148,7 +148,7 @@ tokens and non-numeric library keys are dropped server-side; genres are trimmed 
 chars.
 
 ### `GET /api/v1/status`
-`{ scanning, everScanned, error, progress, videos, channels, transcoding, serverVersion, capabilities }` —
+`{ scanning, everScanned, error, progress, videos, channels, transcoding, serverVersion, capabilities, hls }` —
 counts are **visibility-filtered**. Use `everScanned=false || scanning` to show an "indexing" state vs
 "empty"; poll (~30s) to auto-refresh the feed when a background scan finishes. `transcoding` is legacy
 (always 0).
@@ -164,6 +164,19 @@ first boot / just-added library reads as *working*, never as broken-empty. Two s
 full re-parse of established libraries queues behind it), and channel `video_count`s refresh **per batch**
 (nav tabs / `GET libraries` include the new library while its walk is still running — clients that fetch
 the libraries list once per launch will see it on their next fetch or via their status poll).
+**Channel tile art fallback** (added 0.4.8): a channel with no `poster.jpg|png|webp` in its folder
+gets its newest video's thumbnail as `poster` (signed `/thumb/<videoId>`), decided server-side in
+`signChannelArt` from `fallback_thumb_id`, so no client renders an initial where a picture exists.
+Clients keep rendering `poster` as before; a channel with no videos with art still gets `null`.
+**`hls`** (added 0.4.8, additive — older servers omit it; `null` when live transcoding is off):
+`{ maxSessions, active, downloadSlots }`. An offline download of an HLS rendition IS a live transcode
+session, so the server and client NEGOTIATE how many may run: the client runs at most `downloadSlots`
+HLS downloads at once (the cap minus one session the server keeps for live viewing; never below 1),
+queues the rest and starts them as slots free, and on a 503 from the segment route (carries
+`Retry-After`) requeues the item instead of failing it. Absent → the client assumes 2. Nothing about
+this reaches the viewer: a batch "just queues" (§Offline). Pools are deliberately small by default
+(3 encoders on CPU / 6 with hwaccel; 4 copies): a copy runs at full disk speed and eight of them on a
+NAS-over-NFS host starved thumbnails and the API (field 2026-09-22).
 **`capabilities`** (added 0.4.0) is the version-negotiation surface: an additive-only string list —
 currently `libraries | series | movies | sessions | prefs | shares | federation` (+ `hls` when live
 transcode is enabled; `federation` added 0.4.2 — see §Federation).
@@ -194,8 +207,10 @@ chapters: [{ start_time, end_time, title }], webpage_url`, and the server-owned:
 - `posterUrl` — signed 2:3 poster, **movies only** (null elsewhere). `playback.poster`/`thumb` stay the
   16:9 fanart — that's what the player backdrop wants; `posterUrl` is for the detail screen's poster.
 - `isVertical` — portrait? (letterbox on a 16:9 screen)
-- `playback: { kind, url, compatUrl, hlsUrl, mimeType, poster, canTranscode }` — the **fail-open** play descriptor
-  (below). `url` (signed original) is **always** present; you always try it first.
+- `playback: { kind, url, compatUrl, hlsUrl, sizeBytes, mimeType, poster, canTranscode }` — the **fail-open** play descriptor
+  (below). `url` (signed original) is **always** present; you always try it first. **`sizeBytes`**
+  (added 0.4.8) = the original file's size in bytes, null for federated items (HEAD the peer `url`
+  instead) or a file that vanished since the scan — for the offline reserve check (§Offline).
 - `watch: { position, watched }` — this user's state
 - `watchedAt` — seconds at which to auto-mark-watched (null = only at end-of-item)
 - `resumePosition` — seconds to seek to on open (null = start from the beginning; already gated server-side)
@@ -447,7 +462,31 @@ seekbar and far-seek restarts work as before). The server refuses silently and E
 codecs can't ride in TS, when the file's one-time keyframe scan is still running (the next session of that
 file copies), or on an old server that doesn't know the parameter — so a client may always send it. Web
 never sends it (Chrome decodes neither HEVC nor Dolby audio); Apple would need fMP4 segments for HEVC and
-is a later increment.
+is a later increment. **`&copyv=<codec[,codec]>` (added 0.4.8)** narrows the copy allowlist to what THIS
+client's demuxer takes in TS: an Apple download sends `mode=copy&copyv=h264`, so an HEVC source is
+encoded rather than copied into something AVPlayer refuses; the engine checks the REAL probed codec.
+**`&dl=1` (added 0.4.8)** marks a DOWNLOAD session: the server waits up to 20 s for the file's one-time
+keyframe scan and, if it is still running, answers 503 + `Retry-After` (the scan finishes in the
+background; the next attempt copies) instead of silently encoding — so a copy-eligible file IS copied
+and the client's pool accounting stays true — and never holds a request longer than a reverse proxy
+waits. A download ENCODE tops out at 1080p (a 4K source is encoded into the 1920×1080 box; ≤1080p sources
+keep their size; a COPY is never touched). It never applies the adaptive downscale — a copy for
+the shelf keeps the source resolution however slowly the host encodes it. Playback never sends it.
+**`&probe=1` (added 0.4.8)** on the playlist route: a client asking "can this start now?" — answered at
+once (503 + `Retry-After` while the file's keyframe scan runs) instead of the 20 s hold a download
+request gets, so a queue can probe many files in parallel. A probe mints a session like any playlist
+request (reused by the real fetch that follows within 20 s).
+**`&fmt=fmp4` (added 0.4.8)** asks for fMP4 (CMAF) segments plus an `#EXT-X-MAP` init section
+(`/hls/s/<sid>/init.mp4`, segments `segNNNNN.m4s`, playlist version 7) for a COPY session — the form
+in which Apple takes HEVC untouched (HEVC in MPEG-TS is refused by AVFoundation; the engine tags HEVC
+`hvc1`). Encodes always stay TS. An Apple download sends `mode=copy&copyv=h264,hevc&fmt=fmp4`, and the
+descriptor's `hlsCopy` is true for H.264 OR HEVC video with AAC/AC-3/E-AC-3/MP3 audio, so an x265
+library remuxes at disk speed instead of encoding. Ignored by a server that predates it (a copy request
+then yields TS, which Apple refuses for HEVC — hence `hlsCopy` stays the gate).
+**Copy sessions have their own pool** (`HLS_MAX_COPY_SESSIONS`, default 8): a remux costs disk and
+network, not an encoder, so it never takes one of the `HLS_MAX_SESSIONS` encoder slots (default 3 on
+CPU; 6 only while a hardware encoder is really usable — asked for AND not disproved — unless the owner
+set the number). Both pools are advertised on §status `hls`.
 
 The server no longer decides *whether* you can play a file — it hands you the original and lets your
 decoder try. Capable TV decoders (ExoPlayer/AVPlay handle VP9/AV1/Opus; AVPlayer often plays a file whose
@@ -790,3 +829,41 @@ client now implements §Audio tracks.
 
 **Client status:** web ✅. Tizen/Android/Apple pending — all three already receive the field.
 
+### §Offline — downloads and follow rules (design: `docs/offline-sync-design.md`, added 0.4.8)
+
+Offline is a **handheld client** feature (iOS first, Android mirrors); TV clients and the web have
+none. The server's whole contribution is three small things; everything else is client-side and
+per device, and the server never learns what a device holds.
+
+- **What to download:** the original `playback.url` when THIS device plays that container and
+  codec pair itself, otherwise the HLS rendition at `playback.hlsUrl` through the platform's own
+  offline HLS downloader (`AVAssetDownloadURLSession` / ExoPlayer `DownloadManager`) — the server
+  transcodes live as segments are pulled, throttled as for playback. `preferHls` forces the HLS
+  route. No codec logic on the client.
+- **Batches queue, negotiated, invisible to the viewer:** an HLS download IS a live transcode
+  session, and the server is the only party that knows how many it can run (it may be serving other
+  viewers). The client reads §status `hls` on every maintenance pass and runs at most `downloadSlots`
+  encode downloads and `copySlots` copy downloads at once (a slot below each cap is kept for live
+  viewing); the rest wait in `queued` and start as slots free, with a fresh signed URL. A 503 from
+the segment route OR the playlist route (`Retry-After`; the latter when every session slot is in use —
+finished downloads are reclaimed first, never a 404) requeues the item, never fails it, with a growing
+backoff and a retry cap. `playback.hlsCopy` (server
+  decision, from the catalog's codec fields, re-checked by the engine) says which pool an item takes
+  and makes the client append `mode=copy&copyv=h264`: an H.264 MKV batch remuxes wide and fast,
+  only HEVC sources wait on an encoder. `hlsCopy` is decided on the file's REAL probe (memoised
+  with the HLS session's), never the catalog's codec fields — an NFO without `<streamdetails>`
+  must not demote a copy to an encode. Absent fields (older server) → 2 encode / 2 copy.
+- **`GET /media/[id]?dl=1`** — the same bytes with `Content-Disposition: attachment; filename=…`
+  (the on-disk basename), so a download engine stores the file under a real name. Ranges, HEAD,
+  ETag and `Content-Length` behave exactly as without it. `Content-Length` is GUARANTEED on every
+  `/media` response (200, 206, HEAD).
+- **`playback.sizeBytes`** — check it against the device's free-space reserve (10 % of the volume, clamped
+  to 1–5 GB) before starting a file download; an HLS download's size is unknown up front.
+- **Watch state offline:** buffer `PATCH /api/v1/watch/[id]` writes in a local outbox and flush in
+  order on reconnect; the server's last-write-wins by timestamp applies as always.
+- **Follow rules** ("keep the next N unwatched" of a series or channel) are evaluated on the
+  client from the ordinary channel-detail responses plus the synced watch state. A video marked
+  watched on ANY client is therefore removed from every device that has "remove after watched" on,
+  at that device's next evaluation — no new endpoint carries this.
+- Signed URLs expire (12 h): a transfer that outlives its URL re-fetches the descriptor and resumes by
+  byte range.

@@ -11,6 +11,10 @@ export interface ChannelSummary {
 	follower_count: number | null;
 	poster_path: string | null;
 	fanart_path: string | null;
+	/** SERVER DECISION (contract §channels): when the channel has no poster file of its own, the id
+	 *  of its newest video that has a thumbnail — `signChannelArt` signs that thumb as the tile art so
+	 *  no client renders an initial where a picture exists (owner 2026-09-25). */
+	fallback_thumb_id?: string | null;
 	video_count: number;
 	/** Items this user hasn't marked watched (episodes for series, videos for channels). Server-computed
 	 *  per-user so every client can render the same unread-style badge. 0 when nothing is unwatched. */

@@ -102,7 +102,26 @@ describe('stream-copy HLS session', () => {
 		expect(p.args).not.toContain('libx264');
 		expect(p.args).not.toContain('-force_key_frames');
 		expect(p.args).not.toContain('-ss'); // boundary 0 is inside the trim lead of the file start
+		// A copy runs at disk speed: the ahead-throttle rides its progress feed, which must report
+		// often (production 2026-09-21: the 5s tick alone let copies fill the transcode volume).
+		expect(p.args).toContain('-stats_period');
+		expect(p.args[p.args.indexOf('-stats_period') + 1]).toBe('0.1');
 		expect(arg(p, '-start_number')).toBe('0');
+	});
+
+	it('fMP4 copy (fmt=fmp4): CMAF segments, an init section, and HEVC tagged hvc1 for Apple', async () => {
+		const s = (await startHlsSession('ep2', null, null, true, new Set(['h264', 'hevc']), true, true))!;
+		expect(s.playlist).toContain('#EXT-X-VERSION:7');
+		expect(s.playlist).toMatch(/#EXT-X-MAP:URI="\/hls\/s\/[0-9a-f]+\/init\.mp4\?/);
+		expect(s.playlist).toContain('seg00000.m4s');
+		expect(s.playlist).not.toContain('.ts?');
+		void hlsSegment(sid(s.playlist), 0);
+		const p = spawned.at(-1)!;
+		expect(p.args).toContain('copy');
+		expect(arg(p, '-hls_segment_type')).toBe('fmp4');
+		expect(arg(p, '-hls_fmp4_init_filename')).toBe('init.mp4');
+		expect(arg(p, '-tag:v')).toBe('hvc1'); // the stub's source is HEVC
+		expect(arg(p, '-hls_segment_filename')).toMatch(/seg%05d\.m4s$/);
 	});
 
 	it('restarts at a far boundary with the coarse-seek + exact-trim construction', async () => {

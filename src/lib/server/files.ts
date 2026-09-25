@@ -50,7 +50,13 @@ export async function resolveInMediaRoot(
  * (304). Takes the already-resolved path + stat from resolveInMediaRoot so it never
  * stats twice. Native players (AVPlayer/ExoPlayer/AVPlay) HEAD-probe then Range-GET.
  */
-export function serveFile(request: Request, absPath: string, st: fs.Stats): Response {
+/** `extra` headers ride on every response shape (200, 206, HEAD) — e.g. the download disposition. */
+export function serveFile(
+	request: Request,
+	absPath: string,
+	st: fs.Stats,
+	extra: Record<string, string> = {}
+): Response {
 	const size = st.size;
 	const type = MIME[path.extname(absPath).toLowerCase()] ?? 'application/octet-stream';
 	const etag = `"${size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}"`;
@@ -64,7 +70,8 @@ export function serveFile(request: Request, absPath: string, st: fs.Stats): Resp
 		// caches explicit permission to reuse images without a revalidation round-trip — the whole
 		// point of the window-aligned signed URLs (mediaToken.ts) is that the URL is a stable cache
 		// key; 1h stays comfortably inside the shortest signature window we mint (2h share HLS).
-		'cache-control': 'private, max-age=3600'
+		'cache-control': 'private, max-age=3600',
+		...extra
 	};
 
 	// Revalidation: let repeat loads (thumbnails, artwork) skip a re-fetch.

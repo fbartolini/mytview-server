@@ -3,11 +3,13 @@ import { getVideo, directPlayMap, needsCompat, isMatroska } from '$lib/server/qu
 import { canSeeChannel } from '$lib/server/visibility';
 import { getWatch, watchedAtSeconds, resumePosition } from '$lib/server/watch';
 import { signedPath, signedHlsIndex } from '$lib/server/mediaToken';
-import { hlsEnabled } from '$lib/server/hls';
+import { hlsEnabled, copyEligible } from '$lib/server/hls';
 import { fedPlaybackUrls, FedError } from '$lib/server/fedclient';
 import { fedIdParts, linkByPrefix } from '$lib/server/federation';
 import { runFedSync } from '$lib/server/fedsync';
 import { resolveTracks, audioTracksFor, prefersHlsForTextStreams } from '$lib/server/subsembed';
+import { resolveInMediaRoot } from '$lib/server/files';
+import { db } from '$lib/server/db';
 import type { RequestHandler } from './$types';
 
 // Video detail for the player screen — one round-trip: full metadata (incl. tags + chapters), this
@@ -28,6 +30,20 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	const audio = video.peer_id == null ? await audioTracksFor(video.id) : [];
 	const isVertical = !!video.width && !!video.height && video.height > video.width;
 	const poster = video.thumb_path ? signedPath('thumb', video.id) : null;
+	// The original file's size (contract §Offline): a client about to keep this video offline checks
+	// it against the device's free-space reserve BEFORE fetching. One stat, local files only — a
+	// federated item's size is the peer's to report (null here; the client HEADs the peer URL).
+	let sizeBytes: number | null = null;
+	if (video.peer_id == null) {
+		try {
+			const row = db().prepare('SELECT video_path FROM videos WHERE id = ?').get(video.id) as
+				| { video_path: string }
+				| undefined;
+			if (row) sizeBytes = (await resolveInMediaRoot(row.video_path)).stat.size;
+		} catch {
+			/* vanished since the scan → null; the download will 404 and the client marks it stale */
+		}
+	}
 
 	// Fail-open playback (mirrors the web <video>): the client ALWAYS attempts the original `url`
 	// first — a capable decoder (ExoPlayer/Tizen, or AVPlayer on a file whose codec fields don't match
@@ -41,6 +57,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		url: string;
 		compatUrl: string | null;
 		hlsUrl: string | null;
+		sizeBytes: number | null;
 		mimeType: string;
 		poster: string | null;
 		canTranscode: boolean;
@@ -49,6 +66,11 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		 *  demuxer failure on some panels that no client can detect (contract §playback descriptor,
 		 *  the same class as the web's webPrefersCompat). Absent/false = the normal fail-open ladder. */
 		preferHls: boolean;
+		/** SERVER DECISION (contract §Offline): a download of this file's HLS rendition can be a STREAM
+		 *  COPY on an Apple client (H.264 or HEVC video + AAC/AC-3/E-AC-3/MP3 audio — decided on the REAL
+		 *  probe, memoised with the session's) — the client appends `&mode=copy&copyv=h264,hevc&fmt=fmp4` and counts
+		 *  it against the copy pool, not the encoder pool. false = an encode (or HLS off). */
+		hlsCopy: boolean;
 		/** Subtitle sidecars found next to the media file, in server-decided order — clients render
 		 *  as given. `kind: 'captions'` marks SDH/CC (the accessibility-relevant ones); the player
 		 *  should offer them and start with all tracks OFF unless the user chose otherwise. Empty
@@ -68,10 +90,13 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		// UNIVERSAL fail-open — the client still tries `url` first and only reaches for HLS on a real
 		// decode error (the /hls route already starts a session for any id).
 		hlsUrl: hlsEnabled() ? signedHlsIndex(video.id) : null,
+		sizeBytes,
 		mimeType: 'video/mp4',
 		poster,
 		canTranscode: false,
 		preferHls: hlsEnabled() && prefersHlsForTextStreams(tracks.filter((t) => t.streamIndex != null).length),
+		// H.264 OR HEVC: with fMP4 segments (`fmt=fmp4`) Apple takes both untouched.
+		hlsCopy: hlsEnabled() && video.peer_id == null && (await copyEligible(video.id, new Set(['h264', 'hevc']))),
 		audioTracks: audio,
 		subtitles: tracks.map((t, i) => ({
 			lang: t.lang,

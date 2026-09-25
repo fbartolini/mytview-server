@@ -26,6 +26,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=8700
+# Keep idle connections open LONGER than a reverse proxy's upstream keep-alive (nginx/Traefik/Caddy
+# default 60 s): Node's 5 s default let the proxy reuse a connection Node had just closed, and the
+# first request on it died (a 502) while the retry worked — the "thumbnail appears after a few
+# seconds" the owner saw on 2026-09-25. headersTimeout must exceed keepAliveTimeout (Node rule).
+ENV KEEP_ALIVE_TIMEOUT=65
+ENV HEADERS_TIMEOUT=66
 # ffmpeg for on-demand transcoding (idle unless a client requests a transcode). VAAPI HW
 # drivers for TRANSCODE_HWACCEL=1 + /dev/dri: intel-media-va-driver (iHD) is what modern
 # Intel iGPUs (Gen8+) need — mesa's VAAPI is AMD-only; i965 covers legacy Intel. iHD is in

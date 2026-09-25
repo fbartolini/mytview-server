@@ -45,7 +45,9 @@ export function listChannels(
 	const rows = db()
 		.prepare(
 			`SELECT id, name, kind, library_id, yt_channel_id, url, follower_count, poster_path, fanart_path, video_count, genres,
-			        ${unwatched} AS unwatched
+			        ${unwatched} AS unwatched,
+			        (SELECT v.id FROM videos v WHERE v.channel_id = channels.id AND v.thumb_path IS NOT NULL
+			           ORDER BY v.timestamp DESC NULLS LAST, v.upload_date DESC LIMIT 1) AS fallback_thumb_id
 			 FROM channels WHERE ${visibilityClause(user, 'id')}${libClause} ORDER BY ${orderBy}`
 		)
 		.all() as (Omit<ChannelSummary, 'genres'> & { genres: string | null })[];
@@ -163,7 +165,13 @@ export function getChannel(
 		| undefined;
 	if (!raw) return null;
 	if (!canSeeChannel({ id: userId }, id)) return null; // private + not granted → treat as absent
-	const channel: ChannelSummary = { ...raw, genres: parseGenres(raw.genres) };
+	const fallback = db()
+		.prepare(
+			`SELECT id FROM videos WHERE channel_id = ? AND thumb_path IS NOT NULL
+			 ORDER BY timestamp DESC NULLS LAST, upload_date DESC LIMIT 1`
+		)
+		.get(id) as { id: string } | undefined;
+	const channel: ChannelSummary = { ...raw, genres: parseGenres(raw.genres), fallback_thumb_id: fallback?.id ?? null };
 	// Movies sort user-chosen (title/year/added — the poster-wall knobs); channels/series keep the one
 	// shared order (episodes by season/episode, channel videos newest-first).
 	const orderBy =

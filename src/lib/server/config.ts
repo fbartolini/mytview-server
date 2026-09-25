@@ -79,7 +79,20 @@ export const HLS_DIR =
 // client retries / fails soft. A session whose encoder was idle-reaped no longer counts.
 // FLOORED at 1 — `HLS_DIR=off` is the off switch; 0 here would still mint sessions and advertise hlsUrl
 // but 503 every segment (a half-broken mode nobody wants).
-export const HLS_MAX_SESSIONS = Math.max(int(env.HLS_MAX_SESSIONS, 3), 1);
+// Default 3 on CPU; 6 with a hardware encoder asked for (an Intel iGPU encodes several 1080p streams in
+// real time — the owner raises it further once vainfo/About confirm the device is in use).
+export const HLS_MAX_SESSIONS = Math.max(int(env.HLS_MAX_SESSIONS, TRANSCODE_HWACCEL ? 6 : 3), 1);
+// Whether the owner SET the cap: if not, the engine picks 6 only while the hardware encoder is really
+// in use and falls back to 3 the moment VAAPI proves unusable (an asked-for-but-absent GPU otherwise
+// let six CPU encodes loose — field 2026-09-23, every one below real time).
+export const HLS_MAX_SESSIONS_EXPLICIT = env.HLS_MAX_SESSIONS != null && env.HLS_MAX_SESSIONS !== '';
+// STREAM-COPY sessions (contract §HLS `?mode=copy`: a remux, no encoder) are near-free — disk and
+// network, not CPU/GPU — so they have their OWN, larger cap and never take an encoder slot. An offline
+// download of an H.264 MKV on Apple is exactly this: the whole batch remuxes in parallel instead of
+// queueing behind three encodes.
+// Default 4: each copy reads the source and writes segments at full speed, and on a NAS-over-NFS
+// deployment eight of them starved everything else (thumbnails, the API) — field 2026-09-22.
+export const HLS_MAX_COPY_SESSIONS = Math.max(int(env.HLS_MAX_COPY_SESSIONS, 4), 1);
 // Idle handling is TWO-STAGE so a PAUSE doesn't destroy the session (resume past the buffer would then 503):
 // after HLS_IDLE_SEC with no segment request only the ffmpeg is REAPED (frees CPU) — the session + its
 // buffered segments stay, and a resume restarts the encoder at the offset.

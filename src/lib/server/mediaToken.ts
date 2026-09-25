@@ -102,7 +102,9 @@ export function signChannelArt<T extends ChannelSummary>(
 ): T & { poster: string | null; fanart: string | null } {
 	return {
 		...c,
-		poster: c.poster_path ? signedPath('poster', c.id) : null,
+		// No poster file in the channel folder → the newest video's thumbnail stands in (server
+		// decision, so the web and every app show the same tile instead of an initial).
+		poster: c.poster_path ? signedPath('poster', c.id) : c.fallback_thumb_id ? signedPath('thumb', c.fallback_thumb_id) : null,
 		fanart: c.fanart_path ? signedPath('fanart', c.id) : null
 	};
 }
