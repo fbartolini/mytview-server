@@ -31,7 +31,7 @@ Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
 <p align="center">
   <img src="docs/screenshots/iphone-recent.jpg" width="196" alt="Recent feed on iPhone" />
   <img src="docs/screenshots/iphone-offline.jpg" width="196" alt="Offline mode on iPhone: the copies on the device" />
-  <img src="docs/screenshots/iphone-player.jpg" width="196" alt="The player on iPhone" />
+  <img src="docs/screenshots/iphone-download.jpg" width="196" alt="Downloading a video on iPhone" />
   <img src="docs/screenshots/iphone-library.jpg" width="196" alt="Library tab on iPhone" />
 </p>
 <p align="center">
