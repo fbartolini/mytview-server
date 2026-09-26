@@ -78,6 +78,8 @@ describe.skipIf(!haveFfmpeg)('fMP4 stream copy, real ffmpeg', () => {
 		expect(init.status).toBe(200);
 		expect(init.headers.get('content-type')).toBe('video/mp4');
 		const initBytes = new Uint8Array(await init.arrayBuffer());
+		// The FIRST request of the session: ffmpeg creates init.mp4 empty and fills it at the first
+		// fragment flush — the route must wait for the real bytes (rig 2026-09-26: a 0-byte init).
 		expect(initBytes.length).toBeGreaterThan(100);
 		expect(String.fromCharCode(...initBytes.slice(4, 8))).toBe('ftyp');
 		const seg = await call(segRoute, { sid, seg: 'seg00000.m4s' }, `http://h/hls/s/${sid}/seg00000.m4s?${sig}`);

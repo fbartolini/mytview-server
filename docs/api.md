@@ -483,6 +483,12 @@ in which Apple takes HEVC untouched (HEVC in MPEG-TS is refused by AVFoundation;
 descriptor's `hlsCopy` is true for H.264 OR HEVC video with AAC/AC-3/E-AC-3/MP3 audio, so an x265
 library remuxes at disk speed instead of encoding. Ignored by a server that predates it (a copy request
 then yields TS, which Apple refuses for HEVC — hence `hlsCopy` stays the gate).
+**`&copya=<codec[,codec]>` (added 0.4.9)** narrows the AUDIO copy allowlist to what THIS client's decoders
+take: a phone without an AC-3/E-AC-3 decoder sends `copya=aac,mp3`, and a track outside the list is
+encoded to AAC (stereo, 160k) while the video is still copied. **The video alone decides whether a session
+is a copy** (0.4.9): audio that TS can't carry (DTS, TrueHD, Opus, FLAC) or that the caller excluded is
+encoded on its own, never a reason to encode the video, so `hlsCopy` is true for any H.264/HEVC source
+whatever its soundtrack. Servers before 0.4.9 ignore `copya` and encode the whole file for such audio.
 **Copy sessions have their own pool** (`HLS_MAX_COPY_SESSIONS`, default 8): a remux costs disk and
 network, not an encoder, so it never takes one of the `HLS_MAX_SESSIONS` encoder slots (default 3 on
 CPU; 6 only while a hardware encoder is really usable — asked for AND not disproved — unless the owner
@@ -837,7 +843,8 @@ per device, and the server never learns what a device holds.
 
 - **What to download:** the original `playback.url` when THIS device plays that container and
   codec pair itself, otherwise the HLS rendition at `playback.hlsUrl` through the platform's own
-  offline HLS downloader (`AVAssetDownloadURLSession` / ExoPlayer `DownloadManager`) — the server
+  offline HLS downloader (`AVAssetDownloadURLSession`; Android pulls the VOD playlist's segments itself
+  into a local playlist, see `docs/offline-sync-design.md` §Android) — the server
   transcodes live as segments are pulled, throttled as for playback. `preferHls` forces the HLS
   route. No codec logic on the client.
 - **Batches queue, negotiated, invisible to the viewer:** an HLS download IS a live transcode
@@ -857,6 +864,14 @@ backoff and a retry cap. `playback.hlsCopy` (server
   (the on-disk basename), so a download engine stores the file under a real name. Ranges, HEAD,
   ETag and `Content-Length` behave exactly as without it. `Content-Length` is GUARANTEED on every
   `/media` response (200, 206, HEAD).
+- **`playback.sourceCodecs`** (added 0.4.9, additive) — `{ video, audio } | null`: the source's REAL codec
+  pair from the server's memoised probe (the default audio stream), null when HLS is off or the file
+  can't be probed. A client deciding to keep the ORIGINAL file offline checks both halves against its
+  own decoders (Android: `MediaCodecList`; a phone typically decodes H.264/HEVC/VP9/AV1 and AAC/MP3/
+  Opus/Vorbis/FLAC but NOT AC-3/E-AC-3/DTS/TrueHD) and takes the HLS route otherwise, appending
+  `mode=copy&copyv=h264,hevc&copya=<what it decodes>&fmt=fmp4` when `hlsCopy` is set — so a copy is never
+  a silent copy, and CMAF rather than TS (HEVC in TS stalled an ExoPlayer decoder at the first frame). Never decide this from the catalog's `vcodec`/`acodec` (they may not match the muxed file).
+  Absent (older server) → fall back to `kind == direct` (+ `isMkv` on a client that demuxes Matroska).
 - **`playback.sizeBytes`** — check it against the device's free-space reserve (10 % of the volume, clamped
   to 1–5 GB) before starting a file download; an HLS download's size is unknown up front.
 - **Watch state offline:** buffer `PATCH /api/v1/watch/[id]` writes in a local outbox and flush in

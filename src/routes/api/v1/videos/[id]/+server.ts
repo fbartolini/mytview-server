@@ -3,7 +3,7 @@ import { getVideo, directPlayMap, needsCompat, isMatroska } from '$lib/server/qu
 import { canSeeChannel } from '$lib/server/visibility';
 import { getWatch, watchedAtSeconds, resumePosition } from '$lib/server/watch';
 import { signedPath, signedHlsIndex } from '$lib/server/mediaToken';
-import { hlsEnabled, copyEligible } from '$lib/server/hls';
+import { hlsEnabled, copyEligible, sourceCodecs } from '$lib/server/hls';
 import { fedPlaybackUrls, FedError } from '$lib/server/fedclient';
 import { fedIdParts, linkByPrefix } from '$lib/server/federation';
 import { runFedSync } from '$lib/server/fedsync';
@@ -71,6 +71,11 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		 *  probe, memoised with the session's) — the client appends `&mode=copy&copyv=h264,hevc&fmt=fmp4` and counts
 		 *  it against the copy pool, not the encoder pool. false = an encode (or HLS off). */
 		hlsCopy: boolean;
+		/** SERVER TRUTH (contract §Offline, added 0.4.9): the source's real codec pair from the memoised
+		 *  probe — what a client about to keep the ORIGINAL file offline checks against its own decoders
+		 *  (a phone without an E-AC-3 decoder must take the HLS copy, or the copy is silent). null when
+		 *  HLS is off or the file can't be probed; the catalog's codec fields are never used for this. */
+		sourceCodecs: { video: string | null; audio: string | null } | null;
 		/** Subtitle sidecars found next to the media file, in server-decided order — clients render
 		 *  as given. `kind: 'captions'` marks SDH/CC (the accessibility-relevant ones); the player
 		 *  should offer them and start with all tracks OFF unless the user chose otherwise. Empty
@@ -97,6 +102,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		preferHls: hlsEnabled() && prefersHlsForTextStreams(tracks.filter((t) => t.streamIndex != null).length),
 		// H.264 OR HEVC: with fMP4 segments (`fmt=fmp4`) Apple takes both untouched.
 		hlsCopy: hlsEnabled() && video.peer_id == null && (await copyEligible(video.id, new Set(['h264', 'hevc']))),
+		sourceCodecs: hlsEnabled() && video.peer_id == null ? await sourceCodecs(video.id) : null,
 		audioTracks: audio,
 		subtitles: tracks.map((t, i) => ({
 			lang: t.lang,

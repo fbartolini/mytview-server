@@ -40,6 +40,13 @@ describe('offline: server contribution', () => {
 		expect(body.playback.hlsCopy).toBe(false);
 	});
 
+	it('the descriptor carries the source codec pair from the real probe (null halves when unprobeable)', async () => {
+		const res = await detailRoute.GET({ params: { id: 'a1' }, locals: { user } } as never);
+		const body = await res.json();
+		// HLS is on and the row resolves, so the shape is there; random bytes probe to no streams.
+		expect(body.playback.sourceCodecs).toEqual({ video: null, audio: null });
+	});
+
 	it('the descriptor carries the original file size', async () => {
 		const res = await detailRoute.GET({ params: { id: 'a1' }, locals: { user } } as never);
 		const body = await res.json();

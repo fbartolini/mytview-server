@@ -21,10 +21,25 @@ this server over its [documented API](docs/api.md).
 - 💬 **Subtitles & captions** — picked up from `.srt`/`.vtt` files next to the video *or* from text tracks inside the `.mkv`/`.mp4` itself, with SDH/CC marked as captions. Nothing is downloaded: what's on disk is what you get. **Image-based subtitles (PGS/VobSub) are not supported** — they're pictures of text and would need OCR or a burned-in re-encode; use a text (SRT) version instead.
 - 🔗 **Share links** — per-video public links with expiry and view caps, link-preview cards, and the same live-HLS fallback for recipients.
 - 🌐 **Federation** — peer with **any number** of other MytView servers, sharing and consuming in both directions. Share different channels, shows, or whole libraries with each household; everything you consume merges into your own libraries (browse, search, and watch state stay on *your* server) while video streams flow **directly** from whichever server holds the file — plus per-peer concurrent-stream caps and consumption stats for the sharer.
-- 📲 **Offline on the phone** — the iPhone/iPad app (Android next) keeps movies and episodes on the device and follows a series for the next unwatched ones; the server hands out each copy in the format the device plays (H.264 and HEVC MKVs are remuxed, not re-encoded), paced by a negotiated session budget so a batch never crowds out someone watching live.
+- 📲 **Offline on the phone** — the iPhone/iPad app (Android in open testing) keeps movies and episodes on the device and follows a series for the next unwatched ones; the server hands out each copy in the format the device plays (H.264 and HEVC MKVs are remuxed, not re-encoded), paced by a negotiated session budget so a batch never crowds out someone watching live.
 - 🔄 **Plex sync** — two-way watched-state and resume-point sync with a Plex server on the same library. Each user links their own Plex account (plex.tv PIN flow); years of existing Plex history import on the first sync, and an unwatch in either app propagates to the other.
 
 Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/iphone-recent.jpg" width="196" alt="Recent feed on iPhone" />
+  <img src="docs/screenshots/iphone-offline.jpg" width="196" alt="Offline mode on iPhone: the copies on the device" />
+  <img src="docs/screenshots/iphone-player.jpg" width="196" alt="The player on iPhone" />
+  <img src="docs/screenshots/iphone-library.jpg" width="196" alt="Library tab on iPhone" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/ipad-recent.jpg" width="440" alt="Recent feed on iPad" />
+  <img src="docs/screenshots/android-library.jpg" width="196" alt="Library on an Android phone" />
+</p>
+
+*The demo library in these shots is Blender's open movies and NASA public-domain footage.*
 
 ---
 
@@ -149,9 +164,10 @@ from the install date itself, with nothing to claim or register.
 
 **Get the apps:**
 
-- **iPhone / iPad / Apple TV**: [on the App Store](https://apps.apple.com/app/id6790113115) — the
-  offline-downloads release (1.2) is in review as of 2026-09-25
+- **iPhone / iPad / Apple TV**: [on the App Store](https://apps.apple.com/app/id6790113115) — iPhone
+  and iPad 1.2 with offline downloads, Apple TV 1.1
 - **Android phone / tablet / Google TV**: [on Google Play](https://play.google.com/store/apps/details?id=com.mytview.app)
+  as an open beta, no invite needed (offline downloads are in testing and follow in the next release)
 - **Samsung TV**: free for everyone, lands on the Samsung store when Samsung's review completes —
   [watch releases](https://github.com/fbartolini/mytview-server/releases) for the announcement
 

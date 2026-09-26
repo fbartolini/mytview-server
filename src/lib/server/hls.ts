@@ -14,7 +14,7 @@
  * spike/hls-spike.mjs.
  */
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync } from 'node:fs';
 import { rm, unlink, readdir } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import crypto from 'node:crypto';
@@ -89,6 +89,13 @@ interface Session {
 	 *  Drives both the playlist's real durations and the restart-at-boundary math in ffmpegArgs. */
 	bounds: number[] | null;
 	reqCopy: boolean; // what the caller ASKED for (reuse key) — copy may be refused for an ineligible codec
+	/** The copy allowlists the caller sent (`copyv` / `copya`), normalised — part of the reuse key:
+	 *  a session minted for a client that takes HEVC in TS must never be handed to one that doesn't. */
+	copyKey: string;
+	/** Copy sessions: the audio stream rides untouched (true) or is encoded to AAC because the
+	 *  caller's `copya` allowlist excludes it or TS can't carry it (false). Video is ALWAYS copied
+	 *  in a copy session — that is what makes it a copy (contract §HLS `copya`). */
+	audioCopy: boolean;
 	/** A DOWNLOAD (contract §HLS `dl=1`): no start-latency to protect and no real-time to keep — waits
 	 *  for the keyframe scan instead of encoding, never downscales (a copy for the shelf keeps the
 	 *  source resolution however slow the host), never learns a "slow" rung for the file. */
@@ -411,16 +418,14 @@ async function probeFile(srcAbs: string, cacheKey: string) {
 	return probed;
 }
 
-/** Would `?mode=copy` (narrowed by `copyVideo`, contract §HLS `copyv`) copy this file's DEFAULT track
- *  pair, or encode it? The descriptor's `playback.hlsCopy` — decided on the REAL probe, not the
- *  catalog's codec fields (an NFO without <streamdetails> says nothing; a wrong one would misroute).
- *  Memoised with the session probe, so the second ask is free. false when HLS is off or unprobeable. */
-export async function copyEligible(videoId: string, copyVideo: Set<string> | null): Promise<boolean> {
-	if (!HLS_DIR) return false;
+/** The file's REAL probe (memoised with the session's) for a video row, or null when HLS is off, the
+ *  row is unknown or the file can't be resolved. */
+async function probeForVideo(videoId: string) {
+	if (!HLS_DIR) return null;
 	const row = db().prepare('SELECT video_path FROM videos WHERE id = ?').get(videoId) as
 		| { video_path: string }
 		| undefined;
-	if (!row) return false;
+	if (!row) return null;
 	let srcAbs: string;
 	let mtimeMs: number;
 	try {
@@ -428,18 +433,38 @@ export async function copyEligible(videoId: string, copyVideo: Set<string> | nul
 		srcAbs = r.absPath;
 		mtimeMs = r.stat.mtimeMs;
 	} catch {
-		return false;
+		return null;
 	}
-	const p = await probeFile(srcAbs, `${srcAbs}:${mtimeMs}`);
+	return probeFile(srcAbs, `${srcAbs}:${mtimeMs}`);
+}
+
+/** The DEFAULT audio stream's codec from a probe (the stream the file flags default, else the first). */
+function defaultAudioCodec(p: Awaited<ReturnType<typeof probeFile>>): string | null {
 	const aIdx = p.audio ?? [...p.acodecs.keys()][0];
-	const acodec = aIdx != null ? p.acodecs.get(aIdx) : undefined;
-	return !!(
-		p.vcodec &&
-		COPY_VIDEO.has(p.vcodec) &&
-		(copyVideo == null || copyVideo.has(p.vcodec)) &&
-		acodec &&
-		COPY_AUDIO.has(acodec)
-	);
+	return (aIdx != null ? p.acodecs.get(aIdx) : undefined) ?? null;
+}
+
+/** Would `?mode=copy` (narrowed by `copyVideo`, contract §HLS `copyv`) copy this file's VIDEO, or
+ *  encode it? The descriptor's `playback.hlsCopy` — decided on the REAL probe, not the catalog's
+ *  codec fields (an NFO without <streamdetails> says nothing; a wrong one would misroute). Audio is
+ *  never the reason to encode video: a copy session copies the audio when TS carries it and the
+ *  caller takes it (`copya`), else encodes just the audio to AAC (contract §HLS, 2026-09-26 — an
+ *  H.264 + DTS MKV used to cost an x264 encode for its soundtrack alone). Memoised with the session
+ *  probe, so the second ask is free. false when HLS is off or unprobeable. */
+export async function copyEligible(videoId: string, copyVideo: Set<string> | null): Promise<boolean> {
+	const p = await probeForVideo(videoId);
+	if (!p) return false;
+	return !!(p.vcodec && COPY_VIDEO.has(p.vcodec) && (copyVideo == null || copyVideo.has(p.vcodec)));
+}
+
+/** The source's real codec pair (contract §playback descriptor `sourceCodecs`): what a client that
+ *  is about to keep the ORIGINAL file offline checks against its own decoders, instead of trusting
+ *  the catalog's codec fields. null when HLS is off or the file can't be probed (an old server's
+ *  shape); a probe that found no stream reports null for that half. */
+export async function sourceCodecs(videoId: string): Promise<{ video: string | null; audio: string | null } | null> {
+	const p = await probeForVideo(videoId);
+	if (!p) return null;
+	return { video: p.vcodec ?? null, audio: defaultAudioCodec(p) };
 }
 
 const probeCache = new Map<
@@ -540,9 +565,13 @@ export async function startHlsSession(
 	fmp4 = false,
 	/** A client PROBE (`probe=1`): answer at once — 503 while the keyframe scan runs, never a 20 s hold —
 	 *  so a queue can ask about many files in parallel without serialising on the waits. */
-	probe = false
+	probe = false,
+	/** Narrow the AUDIO copy allowlist to what THIS client decodes (contract §HLS `copya`): a phone
+	 *  without an AC-3/E-AC-3 decoder asks `copya=aac,mp3`, and such a track is encoded to AAC while
+	 *  the video is still copied. null = every codec TS carries. */
+	copyAudio: Set<string> | null = null
 ): Promise<{ sid: string; playlist: string } | null> {
-	return startHlsSessionImpl(videoId, fed, audioIndex, wantCopy, copyVideo, download, fmp4, probe);
+	return startHlsSessionImpl(videoId, fed, audioIndex, wantCopy, copyVideo, download, fmp4, probe, copyAudio);
 }
 
 async function startHlsSessionImpl(
@@ -556,9 +585,11 @@ async function startHlsSessionImpl(
 	copyVideo: Set<string> | null,
 	download: boolean,
 	fmp4: boolean,
-	probe = false
+	probe = false,
+	copyAudio: Set<string> | null = null
 ): Promise<{ sid: string; playlist: string } | null> {
 	if (!HLS_DIR) return null;
+	const copyKey = wantCopy ? `${[...(copyVideo ?? [])].sort().join(',')}|${[...(copyAudio ?? [])].sort().join(',')}` : '';
 	// Playlist refetch collapse: reuse a just-minted session for the same video that nobody has pulled
 	// a segment from yet (the Safari/AVPlayer multi-fetch at start), instead of minting a dir + probes
 	// per GET. Once a segment has been fetched the session is someone's live playback — never shared.
@@ -572,6 +603,7 @@ async function startHlsSessionImpl(
 			s.videoId === videoId &&
 			s.reqAudio === audioIndex &&
 			s.reqCopy === wantCopy && // a copy playlist and an encode playlist address DIFFERENT segments
+			s.copyKey === copyKey && // …and a copy for one client's decoders is not a copy for another's
 			s.download === download &&
 			s.fmp4 === (fmp4 && s.copy) &&
 			!s.everFetched &&
@@ -606,11 +638,16 @@ async function startHlsSessionImpl(
 	// Copy eligibility: what TS can carry for the chosen track pair. Refused silently → a normal encode.
 	let bounds: number[] | null = null;
 	let copyEnd = duration;
+	let audioCopy = false;
 	if (wantCopy) {
 		const aIdx = audioIndex ?? probed.audio ?? [...probed.acodecs.keys()][0];
 		const acodec = aIdx != null ? probed.acodecs.get(aIdx) : undefined;
 		const vOk = probed.vcodec && COPY_VIDEO.has(probed.vcodec) && (copyVideo == null || copyVideo.has(probed.vcodec));
-		if (vOk && acodec && COPY_AUDIO.has(acodec)) {
+		// The VIDEO decides whether this is a copy. The audio rides untouched when TS carries it AND
+		// the caller's decoders take it (`copya`); otherwise only the audio is encoded, to AAC — a
+		// trivial CPU cost, still a copy-pool session (contract §HLS `copya`, 2026-09-26).
+		audioCopy = !!(acodec && COPY_AUDIO.has(acodec) && (copyAudio == null || copyAudio.has(acodec)));
+		if (vOk) {
 			const scan = await Promise.race([
 				scanKeyframes(srcAbs, cacheKey),
 				new Promise<undefined>((r) =>
@@ -687,7 +724,7 @@ async function startHlsSessionImpl(
 		// real time, and the copy would take hours (owner 2026-09-24). Sources at or under 1080p keep
 		// their size; playback keeps the source resolution until the host proves it can't keep up.
 		probeKey: cacheKey, scaleStep: download ? (scaledSize(probed.width, probed.height, 1) ? 1 : 0) : (slowSources.get(cacheKey) ?? 0),
-		copy: bounds != null, bounds, reqCopy: wantCopy, download,
+		copy: bounds != null, bounds, reqCopy: wantCopy, copyKey, audioCopy: bounds != null && audioCopy, download,
 		fmp4: bounds != null && fmp4, vcodec: probed.vcodec
 	});
 	startGc();
@@ -737,8 +774,29 @@ export async function hlsInit(sid: string): Promise<string | null> {
 	s.lastAccess = Date.now();
 	s.everFetched = true;
 	if (!ensureCovers(s, s.lastFetched)) return null;
-	if (!(await waitFor(initPath(s), 45000))) return null;
+	// ffmpeg CREATES the init file at header time and FILLS it when the first fragment flushes, so
+	// "exists" served a 0-byte init.mp4 to the first request of every session (rig 2026-09-26: the
+	// Android client read it as an empty file and failed the download; AVFoundation had been racing it
+	// too). Ready = non-empty AND a segment has landed (segments rename in only after the init is final).
+	if (!(await waitForInit(s, 45000))) return null;
 	return initPath(s);
+}
+
+async function waitForInit(s: Session, ms: number): Promise<boolean> {
+	const deadline = Date.now() + ms;
+	const ready = () => {
+		try {
+			if (statSync(initPath(s)).size === 0) return false;
+		} catch {
+			return false;
+		}
+		return readdirSync(s.dir).some((f) => /^seg\d+\.m4s$/.test(f));
+	};
+	while (Date.now() < deadline) {
+		if (ready()) return true;
+		await new Promise((r) => setTimeout(r, 60));
+	}
+	return ready();
 }
 
 export async function hlsSegment(sid: string, n: number): Promise<string | null> {
@@ -920,7 +978,10 @@ function ffmpegArgs(s: Session, start: number): string[] {
 			'-nostats', '-progress', 'pipe:1', '-stats_period', '0.1',
 			...seek.pre, '-i', s.srcAbs, ...seek.post,
 			'-map', '0:V:0', '-map', s.audio != null ? `0:${s.audio}` : '0:a:0?',
-			'-c', 'copy', '-sn', '-dn', // text + data tracks dropped: the demuxer relief this mode exists for
+			'-c:v', 'copy', '-sn', '-dn', // text + data tracks dropped: the demuxer relief this mode exists for
+			// Audio untouched when TS carries it and the caller decodes it; else AAC (the only encode a
+			// copy session ever does — contract §HLS `copya`).
+			...(s.audioCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k', '-ac', '2']),
 			// fMP4: Apple takes HEVC in HLS only as CMAF, and only tagged `hvc1` (not ffmpeg's default `hev1`).
 			...(s.fmp4 && s.vcodec === 'hevc' ? ['-tag:v', 'hvc1'] : []),
 			'-f', 'hls', '-hls_time', String(SEG), '-hls_list_size', '0', '-start_number', String(start),

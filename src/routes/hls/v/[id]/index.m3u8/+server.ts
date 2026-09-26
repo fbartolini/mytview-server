@@ -50,6 +50,10 @@ export const GET: RequestHandler = async ({ params, url, locals, getClientAddres
 	// ?copyv=h264[,hevc] narrows the copy allowlist to what this client plays in TS (contract §HLS).
 	const copyvRaw = url.searchParams.get('copyv');
 	const copyVideo = copyvRaw ? new Set(copyvRaw.split(',').map((v) => v.trim()).filter(Boolean)) : null;
+	// ?copya=aac,mp3 narrows the AUDIO copy allowlist to what this client decodes (contract §HLS):
+	// an excluded track is encoded to AAC while the video is still copied.
+	const copyaRaw = url.searchParams.get('copya');
+	const copyAudio = copyaRaw ? new Set(copyaRaw.split(',').map((v) => v.trim()).filter(Boolean)) : null;
 	// ?dl=1 marks a DOWNLOAD (contract §HLS): patient keyframe scan, no adaptive downscale.
 	const download = url.searchParams.get('dl') === '1';
 	// ?probe=1: a client asking "can this start now?" — no 20 s hold while a scan runs (contract §HLS).
@@ -58,7 +62,7 @@ export const GET: RequestHandler = async ({ params, url, locals, getClientAddres
 	const fmp4 = url.searchParams.get('fmt') === 'fmp4';
 	let s: Awaited<ReturnType<typeof startHlsSession>>;
 	try {
-		s = await startHlsSession(params.id, fedRef, audioIndex, wantCopy, copyVideo, download, fmp4, probe);
+		s = await startHlsSession(params.id, fedRef, audioIndex, wantCopy, copyVideo, download, fmp4, probe, copyAudio);
 	} catch (e) {
 		// The transcode volume is full / unwritable: a service condition (503), logged once a minute by
 		// the engine — not the unexplained 500 + stack trace this used to be (production 2026-09-21).

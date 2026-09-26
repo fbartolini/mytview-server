@@ -57,8 +57,9 @@ const env = tempEnv();
 process.env.HLS_DIR = path.join(env.base, 'hls');
 const { scan } = await import('../src/lib/server/indexer');
 const { addLibrary } = await import('../src/lib/server/libraries');
-const { startHlsSession, hlsSegment, copyBoundaries } = await import('../src/lib/server/hls');
+const { startHlsSession, hlsSegment, copyBoundaries, copyEligible, sourceCodecs } = await import('../src/lib/server/hls');
 
+const ep2Path = path.join(env.mediaRoot, 'Shows/Kingdom', 'ep2.mp4');
 const sid = (playlist: string) => /\/hls\/s\/([0-9a-f]+)\//.exec(playlist)![1];
 const extinf = (playlist: string) => [...playlist.matchAll(/#EXTINF:([\d.]+),/g)].map((m) => Number(m[1]));
 const arg = (p: FakeProc, flag: string, nth = 0) => {
@@ -124,7 +125,57 @@ describe('stream-copy HLS session', () => {
 		expect(arg(p, '-hls_segment_filename')).toMatch(/seg%05d\.m4s$/);
 	});
 
+	/** The fake ffmpegs never exit, and the copy POOL (HLS_MAX_COPY_SESSIONS = 4) is what gates a spawn at
+	 *  segment time: end every earlier one so each case below gets its own process to inspect. */
+	const drainPool = () => { for (const p of spawned) p.emit('close', 0); };
+
+	it('copya narrows the AUDIO allowlist: the video is copied, the excluded audio is encoded to AAC', async () => {
+		drainPool();
+		// A phone with no E-AC-3 decoder asks copya=aac,mp3 for the stub's HEVC + E-AC-3 source.
+		const s = (await startHlsSession('ep2', null, null, true, new Set(['h264', 'hevc']), true, false, false, new Set(['aac', 'mp3'])))!;
+		expect(extinf(s.playlist).length).toBeGreaterThan(100); // still a COPY session: real keyframe boundaries
+		void hlsSegment(sid(s.playlist), 0);
+		const p = spawned.at(-1)!;
+		expect(arg(p, '-c:v')).toBe('copy');
+		expect(arg(p, '-c:a')).toBe('aac');
+		expect(p.args).not.toContain('libx264');
+		expect(p.args).toContain('-sn');
+	});
+
+	it('without copya (or with the codec allowed) the audio rides untouched', async () => {
+		drainPool();
+		const s = (await startHlsSession('ep2', null, null, true, null, true, false, false, new Set(['eac3', 'aac'])))!;
+		void hlsSegment(sid(s.playlist), 0);
+		const p = spawned.at(-1)!;
+		expect(arg(p, '-c:v')).toBe('copy');
+		expect(arg(p, '-c:a')).toBe('copy');
+	});
+
+	it('an audio codec TS cannot carry (DTS) no longer forces a video encode: copy video, AAC audio', async () => {
+		acodec = 'dts';
+		drainPool();
+		try {
+			expect(await copyEligible('ep2', null)).toBe(true); // the descriptor says "copy" — video decides
+			// A fresh session: the probe cache is keyed on path+mtime, so bump the file's mtime.
+			const { utimesSync } = await import('node:fs');
+			const when = new Date(Date.now() + 5000);
+			utimesSync(ep2Path, when, when);
+			const s = (await startHlsSession('ep2', null, null, true, null, true))!;
+			void hlsSegment(sid(s.playlist), 0);
+			const p = spawned.at(-1)!;
+			expect(arg(p, '-c:v')).toBe('copy');
+			expect(arg(p, '-c:a')).toBe('aac');
+		} finally {
+			acodec = 'eac3';
+		}
+	});
+
+	it('sourceCodecs reports the probed pair for the descriptor', async () => {
+		expect(await sourceCodecs('ep2')).toEqual({ video: 'hevc', audio: expect.any(String) });
+	});
+
 	it('restarts at a far boundary with the coarse-seek + exact-trim construction', async () => {
+		drainPool();
 		const s = (await startHlsSession('ep2', null, null, true))!;
 		void hlsSegment(sid(s.playlist), 0);
 		const first = spawned.at(-1)!;
