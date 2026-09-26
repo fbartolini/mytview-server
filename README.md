@@ -29,13 +29,12 @@ Website: **https://mytview.com** · Privacy: **https://mytview.com/privacy/**
 ## Screenshots
 
 <p align="center">
+  <img src="docs/screenshots/web-hero.jpg" width="820" alt="The web app: the Recent feed of a library, with the main features called out" />
+</p>
+<p align="center">
   <img src="docs/screenshots/iphone-recent.jpg" width="196" alt="Recent feed on iPhone" />
   <img src="docs/screenshots/iphone-offline.jpg" width="196" alt="Offline mode on iPhone: the copies on the device" />
   <img src="docs/screenshots/iphone-download.jpg" width="196" alt="Downloading a video on iPhone" />
-  <img src="docs/screenshots/iphone-library.jpg" width="196" alt="Library tab on iPhone" />
-</p>
-<p align="center">
-  <img src="docs/screenshots/ipad-recent.jpg" width="440" alt="Recent feed on iPad" />
   <img src="docs/screenshots/android-library.jpg" width="196" alt="Library on an Android phone" />
 </p>
 
