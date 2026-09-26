@@ -127,6 +127,13 @@ any subfolder of `/media` can be its own library:
   `fanart.jpg` (the Kodi layout media managers write). Rendered as a poster wall with genre filters and
   title/year/recently-added sorting.
 
+**Creator archives that look like TV shows.** Some download tools present a creator's channel as a
+show (`Show/Season 2021/s2021.e031701 - Title.mp4`) and write both yt-dlp's `.info.json` sidecar and
+a Jellyfin/Kodi `.nfo`. Either library type handles that folder: MytView reads the `.info.json` and
+indexes it as a channel (real titles, upload dates, descriptions, tags), with the same video ids in
+a Channels or a Series library, so watch state survives if you switch. A show with `.nfo` files only
+and date-coded episode numbers is shown by date rather than as "S2021 E31701".
+
 Libraries are explicit: with none configured, nothing is indexed and the first-run screen walks
 the owner through adding one (any subfolder — or the root — per library).
 

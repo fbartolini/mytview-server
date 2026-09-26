@@ -524,14 +524,26 @@ function buildEpisodeRow(
 	mtime: number
 ): Row {
 	const aired = meta?.aired ?? null;
+	let season = meta?.season ?? fname.season;
+	let episode = meta?.episode ?? fname.episode;
+	let title = meta?.title ?? fname.title ?? path.parse(media).name;
+	// Date-coded numbering (season = upload year, episode = MMDD or MMDDnn — what ytdl-sub-style
+	// tools write for a creator channel presented as a show): "S2021·E31701" is not a label anyone
+	// wants. Drop the numbers (cards then show the date, the page orders by it) and the date prefix
+	// such tools put in front of the title.
+	if (season != null && episode != null && season >= 1900 && season <= 2100 && episode >= 100) {
+		season = null;
+		episode = null;
+		title = title.replace(/^\d{4}-\d{2}-\d{2}\s*-\s*/, '') || title;
+	}
 	return {
 		id,
 		channel_id: seriesId,
-		season_number: meta?.season ?? fname.season,
-		episode_number: meta?.episode ?? fname.episode,
+		season_number: season,
+		episode_number: episode,
 		year: null,
 		poster_path: null,
-		title: meta?.title ?? fname.title ?? path.parse(media).name,
+		title,
 		description: meta?.plot ?? null,
 		upload_date: aired ? aired.replace(/-/g, '') : null,
 		timestamp: airedToTs(aired),
@@ -930,87 +942,104 @@ async function indexChannels(lib: Library, ctx: ScanCtx, excluded: Set<string>):
 		.sort();
 
 	for (const cid of topDirs) {
-		const channelDir = path.join(lib.root, cid);
-		const poster = await firstExisting(channelDir, POSTER_NAMES);
-		const fanart = await firstExisting(channelDir, FANART_NAMES);
-		const posterRel = poster ? rel(poster) : null;
-		const fanartRel = fanart ? rel(fanart) : null;
-		let name = cid;
-		let url: string | null = null;
-		let followers: number | null = null;
-		let ytId: string | null = null;
-		let foundAny = false;
-		let enriched = false;
-		let batch: Row[] = [];
-
-		// Genuinely-new channels get the library's default (lib.newPrivate). "New" is judged against the
-		// DURABLE channels_seen record — not this disposable index — so existing channels keep their
-		// visibility even across an index.db rebuild. See visibility.ts / state.ts.
-		const isNewChannel = !ctx.wasSeenBefore.get(cid);
-		ctx.stubChannel.run({ id: cid, kind: 'channel', lib: lib.id, poster: posterRel, fanart: fanartRel, genres: null });
-		ctx.markSeen.run(cid, Date.now());
-		if (isNewChannel) applyNewChannelDefault(cid, lib.newPrivate);
-
-		for await (const infoPath of walkInfo(channelDir)) {
-			let mtime: number;
-			try {
-				mtime = (await fsp.stat(infoPath)).mtimeMs / 1000;
-			} catch {
-				continue;
-			}
-			const relInfo = rel(infoPath);
-			const cached = ctx.existing.get(relInfo);
-			if (!ctx.full && cached && cached.mtime === mtime) {
-				ctx.seenVideos.add(cached.id);
-				foundAny = true;
-			} else {
-				const base = path.basename(infoPath).slice(0, -INFO_SUFFIX.length);
-				const parent = path.dirname(infoPath);
-				const media = await firstExisting(parent, MEDIA_EXTS.map((e) => base + e));
-				if (media) {
-					let info: Record<string, unknown> | null = null;
-					try {
-						info = JSON.parse(await fsp.readFile(infoPath, 'utf-8'));
-					} catch {
-						info = null;
-					}
-					if (info) {
-						const thumb = await findThumb(parent, base, path.basename(media));
-						const vidId = String(info.id ?? base);
-						batch.push(buildVideoRow(info, vidId, cid, media, thumb, infoPath, mtime));
-						ctx.seenVideos.add(vidId);
-						ctx.indexedIds.add(vidId);
-						ctx.counters.indexed++;
-						foundAny = true;
-						enriched = true;
-						name = asStr(info.channel) ?? asStr(info.uploader) ?? name;
-						url = asStr(info.channel_url) ?? asStr(info.uploader_url) ?? url;
-						ytId = asStr(info.channel_id) ?? ytId;
-						if (typeof info.channel_follower_count === 'number') {
-							followers = Math.trunc(info.channel_follower_count);
-						}
-					}
-				}
-			}
-			if (++ctx.counters.processed % BATCH === 0) {
-				if (batch.length) {
-					ctx.upsertBatch(batch);
-					batch = [];
-				}
-				ctx.onBatch(lib);
-				await tick();
-			}
-		}
-		if (batch.length) ctx.upsertBatch(batch);
-		if (foundAny) {
-			ctx.seenChannels.add(cid);
-			if (enriched) {
-				ctx.enrichChannel.run({
-					id: cid, name, kind: 'channel', lib: lib.id, yt: ytId, url, fc: followers, poster: posterRel, fanart: fanartRel, genres: null
-				});
-			}
-		}
+		await indexChannelDir(lib, ctx, cid, path.join(lib.root, cid), null, null);
 		await tick();
+	}
+}
+
+/**
+ * One creator-channel folder (`.info.json` sidecars): the channels library calls this per top-level
+ * dir, and a SERIES library calls it for a show whose episodes carry `.info.json` sidecars (the layout
+ * ytdl-sub-style tools write: yt-dlp's sidecar next to each file plus, for some players, an `.nfo`).
+ * Same row builder and ids either way, so a folder moved between library types keeps its watch state.
+ * `preferredName` (a `tvshow.nfo` title) wins over the sidecars' channel name; `genres` ride on the tile.
+ */
+async function indexChannelDir(
+	lib: Library,
+	ctx: ScanCtx,
+	cid: string,
+	channelDir: string,
+	preferredName: string | null,
+	genres: string | null
+): Promise<void> {
+	const poster = await firstExisting(channelDir, POSTER_NAMES);
+	const fanart = await firstExisting(channelDir, FANART_NAMES);
+	const posterRel = poster ? rel(poster) : null;
+	const fanartRel = fanart ? rel(fanart) : null;
+	let name = cid;
+	let url: string | null = null;
+	let followers: number | null = null;
+	let ytId: string | null = null;
+	let foundAny = false;
+	let enriched = false;
+	let batch: Row[] = [];
+
+	// Genuinely-new channels get the library's default (lib.newPrivate). "New" is judged against the
+	// DURABLE channels_seen record — not this disposable index — so existing channels keep their
+	// visibility even across an index.db rebuild. See visibility.ts / state.ts.
+	const isNewChannel = !ctx.wasSeenBefore.get(cid);
+	ctx.stubChannel.run({ id: cid, kind: 'channel', lib: lib.id, poster: posterRel, fanart: fanartRel, genres });
+	ctx.markSeen.run(cid, Date.now());
+	if (isNewChannel) applyNewChannelDefault(cid, lib.newPrivate);
+
+	for await (const infoPath of walkInfo(channelDir)) {
+		let mtime: number;
+		try {
+			mtime = (await fsp.stat(infoPath)).mtimeMs / 1000;
+		} catch {
+			continue;
+		}
+		const relInfo = rel(infoPath);
+		const cached = ctx.existing.get(relInfo);
+		if (!ctx.full && cached && cached.mtime === mtime) {
+			ctx.seenVideos.add(cached.id);
+			foundAny = true;
+		} else {
+			const base = path.basename(infoPath).slice(0, -INFO_SUFFIX.length);
+			const parent = path.dirname(infoPath);
+			const media = await firstExisting(parent, MEDIA_EXTS.map((e) => base + e));
+			if (media) {
+				let info: Record<string, unknown> | null = null;
+				try {
+					info = JSON.parse(await fsp.readFile(infoPath, 'utf-8'));
+				} catch {
+					info = null;
+				}
+				if (info) {
+					const thumb = await findThumb(parent, base, path.basename(media));
+					const vidId = String(info.id ?? base);
+					batch.push(buildVideoRow(info, vidId, cid, media, thumb, infoPath, mtime));
+					ctx.seenVideos.add(vidId);
+					ctx.indexedIds.add(vidId);
+					ctx.counters.indexed++;
+					foundAny = true;
+					enriched = true;
+					name = asStr(info.channel) ?? asStr(info.uploader) ?? name;
+					url = asStr(info.channel_url) ?? asStr(info.uploader_url) ?? url;
+					ytId = asStr(info.channel_id) ?? ytId;
+					if (typeof info.channel_follower_count === 'number') {
+						followers = Math.trunc(info.channel_follower_count);
+					}
+				}
+			}
+		}
+		if (++ctx.counters.processed % BATCH === 0) {
+			if (batch.length) {
+				ctx.upsertBatch(batch);
+				batch = [];
+			}
+			ctx.onBatch(lib);
+			await tick();
+		}
+	}
+	if (batch.length) ctx.upsertBatch(batch);
+	if (foundAny) {
+		ctx.seenChannels.add(cid);
+		if (enriched) {
+			ctx.enrichChannel.run({
+				id: cid, name: preferredName ?? name, kind: 'channel', lib: lib.id, yt: ytId, url, fc: followers, poster: posterRel, fanart: fanartRel, genres
+			});
+		}
 	}
 }
 
@@ -1048,6 +1077,18 @@ async function indexSeries(lib: Library, ctx: ScanCtx): Promise<void> {
 			} catch {
 				/* keep folder name */
 			}
+		}
+
+		// A show whose episodes carry `.info.json` sidecars (the default output of ytdl-sub-style tools,
+		// which also write a tvshow.nfo + episode .nfo for Jellyfin/Kodi) is a CREATOR CHANNEL, not a
+		// season/episode show: its "episodes" are uploads numbered by date, and the sidecar carries the
+		// real title, upload date, description, tags and counts. Index it through the channel path —
+		// same video ids as a Channels library, so the library type a user picks doesn't matter.
+		if (!(await walkInfo(showDir).next()).done) {
+			const nfoTitle = (await isFile(showNfo)) ? name : null;
+			await indexChannelDir(lib, ctx, seriesId, showDir, nfoTitle === showName ? null : nfoTitle, showGenres);
+			await tick();
+			continue;
 		}
 
 		// Same durable "new" check as indexChannels — never the disposable index.
