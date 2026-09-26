@@ -198,6 +198,14 @@ web player). Transcoding shells out to `ffmpeg`/`ffprobe` (bundled in the Docker
 SQLite databases live in `/data`: `index.db` (disposable cache, rebuilt by scanning) and
 `state.db` (durable: users, sessions, watch state — the only thing worth backing up).
 
+## How it is built
+
+MytView is a solo project, proudly co-created with Anthropic's Claude (Opus and Fable) under my
+direction: the design, the product decisions, the review and the field testing are mine, and every
+increment ships with tests and runs on my own servers before it is released. It is 2026; get over it.
+Opinions on the tooling are not sought here and will not be engaged with. Bug reports and pull
+requests about what the software does are very welcome.
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE). Contributions are welcome under the terms in

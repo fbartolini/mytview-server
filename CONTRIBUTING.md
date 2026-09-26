@@ -43,3 +43,11 @@ npm run dev
 ```
 
 `npm test` runs the vitest suite (no media required — tests build their own fixtures).
+
+## AI-assisted work
+
+This project is co-created with AI coding tools (Anthropic's Claude), under the author's direction,
+and the same standard applies to contributions: use whatever tools you like, test what you submit,
+review it yourself before opening the pull request, and say in the description if it was
+AI-assisted. Pull requests are judged on what they do. The choice of tooling itself is not up for
+debate in this repository; issues opened to argue it will be closed without discussion.
